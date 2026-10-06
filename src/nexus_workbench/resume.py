@@ -847,16 +847,6 @@ class ResumeCoordinator:
             ):
                 raise ResumeBlocked(
                     "DURABLE_REFERENCE_IDENTITY_MISMATCH",
-                    f"completed step {step_id} resolved to another durable identity",
-                )
-            if (
-                action.workbench_session_id != checkpoint.workbench_session_id
-                or action.step_id != step_id
-                or observation.workbench_session_id != checkpoint.workbench_session_id
-                or observation.step_id != step_id
-            ):
-                raise ResumeBlocked(
-                    "DURABLE_REFERENCE_IDENTITY_MISMATCH",
                     f"completed step {step_id} durable records are bound to another identity",
                 )
             try:
