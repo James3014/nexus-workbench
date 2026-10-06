@@ -24,6 +24,24 @@ G1 established protocol records, integrity binding, durable JSON persistence, th
 
 G2 implements one standalone local read-only executor. It binds one exact clean Git worktree plus a disjoint scratch root, admits only fixed read-only repository probes, and physically compares target identity before and after every Action Cell.
 
+G3 adds a measurement layer beside execution rather than adding execution authority:
+
+```text
+frozen BenchmarkCase
+      |
+      +--> BASELINE run trace ----+
+      |                           |
+      +--> WORKBENCH run trace ---+--> exact-run evaluator records
+                                  |
+                                  v
+                         fairness / pairing gate
+                                  |
+                                  v
+                         deterministic report
+```
+
+Run traces contain observed behavior and cost only. Correctness/completion are supplied by separate evaluator records bound to exact run hashes. Synthetic fixtures validate the harness but cannot establish Workbench effectiveness.
+
 The physical target fingerprint includes:
 
 - Git `HEAD`;

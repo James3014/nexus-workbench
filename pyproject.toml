@@ -9,5 +9,8 @@ description = "Transport-neutral, non-authority executable workbench contracts f
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+nexus-workbench-benchmark = "nexus_workbench.benchmark:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
