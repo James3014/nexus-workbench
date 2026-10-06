@@ -11,11 +11,16 @@ This repository owns a non-authority executable-workbench protocol and its stand
 
 ## Current gate
 
-G1 only: protocol + persistence skeleton. No real repository executor, no target-source mutation, no remote-host/browser/vision/multi-agent execution.
+G2 only: standalone isolated read-only repository executor on top of the G1 protocol/persistence skeleton.
+
+Allowed G2 target operations are fixed read-only probes: `repo.read`, `repo.search`, `git.status`, `git.diff`, and `test.discover`. Workbench may create artifacts only in a physically disjoint scratch root through `artifact.write`.
+
+G2 does not authorize target-source mutation, arbitrary shell/Python execution, execution of repository test code, Dev MCP/DevSpace dependency, remote-host/browser/vision/multi-agent execution, G3 resume semantics, G4 benchmarking, or any Nexus authority expansion.
 
 ## Verification
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q src tests
+PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src python -m compileall -q src tests
+git diff --check
 ```

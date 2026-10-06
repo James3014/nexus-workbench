@@ -15,10 +15,22 @@ nexus-workbench
         v
 Executor protocol
         |
-        v
-physical backend (future G2+)
+        +--> LocalReadOnlyExecutor (G2)
+        |
+        +--> future replaceable backends
 ```
 
-G1 implements only protocol records, integrity binding, atomic JSON persistence, the executor interface, and Candidate claim containment. There is no physical repository executor in G1.
+G1 established protocol records, integrity binding, durable JSON persistence, the executor interface, and Candidate claim containment.
 
-Process-local interpreter state is reconstructible cache. Durable Notebook/Action/Observation/Candidate data is explicit state and still does not become Nexus completion authority.
+G2 implements one standalone local read-only executor. It binds one exact clean Git worktree plus a disjoint scratch root, admits only fixed read-only repository probes, and physically compares target identity before and after every Action Cell.
+
+The physical target fingerprint includes:
+
+- Git `HEAD`;
+- `HEAD^{tree}`;
+- porcelain Git status including untracked and ignored paths;
+- a content/mode manifest of the worktree filesystem excluding only the top-level `.git` metadata.
+
+This makes prompt-level "read only" insufficient by design: G2 requires physical readback.
+
+Process-local interpreter state remains reconstructible cache. Durable Notebook/Action/Observation/Candidate data remains explicit state and does not become Nexus completion authority.
