@@ -1,6 +1,6 @@
 # Workbench protocol v1
 
-G1 defines four hash-bound records; G2 adds one concrete read-only executor without changing their authority semantics.
+G1 defines four hash-bound records; G2 adds one concrete read-only executor; G3 adds a deterministic benchmark contract. None changes Nexus authority semantics.
 
 ## WorkbenchNotebook
 
@@ -35,6 +35,21 @@ Scratch-only:
 - `artifact.write` — atomic text artifact write under a physically disjoint Workbench scratch root.
 
 No G2 action accepts arbitrary shell commands, arbitrary Git arguments, arbitrary Python, source writes, or test execution.
+
+## G3 benchmark contract
+
+G3 introduces separate benchmark records:
+
+- `BenchmarkCase` freezes case provenance, source revision, protocol, exact task input, oracle requirements, and evidence universe; its canonical content defines `case_hash`.
+- `BenchmarkRun` binds that exact `case_hash` and records arm identity, model/provider/settings binding, ordered actions, evidence references, token counts, latency, and a result reference. It contains no correctness/completion fields.
+- `BenchmarkEvaluation` supplies external scoring and binds the exact run hash, which therefore transitively binds the frozen case.
+- Identity-bearing semantic payloads such as task input, oracle/evidence entries, action signatures, result references, and evaluator note references are never trim-normalized before hashing; edge whitespace is rejected fail-closed.
+- `BenchmarkBundle` pairs cases, runs, and evaluator records.
+- `build_report` refuses unfair or incomplete pairs and emits exact rational aggregate metrics plus per-case deltas.
+
+The accepted pair requires the same source revision, protocol version, model identity, provider identity, and model-settings hash across BASELINE and WORKBENCH arms.
+
+Synthetic fixture reports always remain under `G3_BENCHMARK_HARNESS_VALIDATED_ONLY`; they are not effectiveness evidence.
 
 ## Candidate
 

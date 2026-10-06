@@ -1,0 +1,190 @@
+{
+  "cases": [
+    {
+      "case_id": "smoke-parity",
+      "category": "bounded-readonly-analysis",
+      "evidence_universe": [
+        "E5",
+        "E6"
+      ],
+      "oracle_requirements": [
+        "reach correct bounded conclusion"
+      ],
+      "protocol_version": "g3-smoke-v1",
+      "provenance_kind": "SYNTHETIC_FIXTURE",
+      "schema": "nexus.workbench.benchmark_case.v1",
+      "source_repository": "James3014/nexus-workbench",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "task_input": "Reach the correct bounded conclusion from the declared read-only evidence."
+    },
+    {
+      "case_id": "smoke-root-cause",
+      "category": "root-cause-diagnosis",
+      "evidence_universe": [
+        "E1",
+        "E2",
+        "E3",
+        "E4"
+      ],
+      "oracle_requirements": [
+        "identify stale runtime identity",
+        "cite source and runtime evidence"
+      ],
+      "protocol_version": "g3-smoke-v1",
+      "provenance_kind": "SYNTHETIC_FIXTURE",
+      "schema": "nexus.workbench.benchmark_case.v1",
+      "source_repository": "James3014/nexus-workbench",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "task_input": "Diagnose the stale runtime identity and support the conclusion with the declared evidence."
+    }
+  ],
+  "evaluations": [
+    {
+      "evaluation_id": "eval-parity-baseline",
+      "evaluator_identity": "fixture-external-evaluator-v1",
+      "false_conclusion_count": 0,
+      "notes_ref": "eval:parity:baseline",
+      "root_cause_correct": true,
+      "run_hash": "561945389cd05bbdb4cf51ddb71c739566e36703ef31df9b396bb036201c157e",
+      "run_id": "run-parity-baseline",
+      "schema": "nexus.workbench.benchmark_evaluation.v1",
+      "task_complete": true
+    },
+    {
+      "evaluation_id": "eval-parity-workbench",
+      "evaluator_identity": "fixture-external-evaluator-v1",
+      "false_conclusion_count": 0,
+      "notes_ref": "eval:parity:workbench",
+      "root_cause_correct": true,
+      "run_hash": "bd88fea7b68f2d8ba5b13e7b9619f6ab3dabe5684beeb11b1177bad355df6c01",
+      "run_id": "run-parity-workbench",
+      "schema": "nexus.workbench.benchmark_evaluation.v1",
+      "task_complete": true
+    },
+    {
+      "evaluation_id": "eval-root-baseline",
+      "evaluator_identity": "fixture-external-evaluator-v1",
+      "false_conclusion_count": 1,
+      "notes_ref": "eval:root:baseline",
+      "root_cause_correct": false,
+      "run_hash": "d206887c0a0d5d76736fb2b1e461bda048de5eb9d04dc223672b46cee740b04d",
+      "run_id": "run-root-baseline",
+      "schema": "nexus.workbench.benchmark_evaluation.v1",
+      "task_complete": false
+    },
+    {
+      "evaluation_id": "eval-root-workbench",
+      "evaluator_identity": "fixture-external-evaluator-v1",
+      "false_conclusion_count": 0,
+      "notes_ref": "eval:root:workbench",
+      "root_cause_correct": true,
+      "run_hash": "7b474c58809670a7062c53b038ffa563814b7b84eb72cfbf9373d17b365e49f0",
+      "run_id": "run-root-workbench",
+      "schema": "nexus.workbench.benchmark_evaluation.v1",
+      "task_complete": true
+    }
+  ],
+  "runs": [
+    {
+      "arm": "BASELINE",
+      "case_hash": "878024b1cb0785f39a4622cf83fe8949fb6effe9d70aa76bdca6e1c7473e9981",
+      "case_id": "smoke-parity",
+      "evidence_refs": [
+        "E5",
+        "E6"
+      ],
+      "input_tokens": 140,
+      "model_identity": "fixture-model-v1",
+      "model_settings_hash": "e161d2660220606653a0b5e97ac870c1da4f2cddee429fdaa23e5f47b541d4a3",
+      "output_tokens": 60,
+      "protocol_version": "g3-smoke-v1",
+      "provider_identity": "fixture-provider",
+      "result_ref": "result:parity:baseline",
+      "run_id": "run-parity-baseline",
+      "schema": "nexus.workbench.benchmark_run.v1",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "tool_actions": [
+        "repo.read:a",
+        "repo.read:b"
+      ],
+      "wall_time_ms": 900
+    },
+    {
+      "arm": "WORKBENCH",
+      "case_hash": "878024b1cb0785f39a4622cf83fe8949fb6effe9d70aa76bdca6e1c7473e9981",
+      "case_id": "smoke-parity",
+      "evidence_refs": [
+        "E5",
+        "E6"
+      ],
+      "input_tokens": 150,
+      "model_identity": "fixture-model-v1",
+      "model_settings_hash": "e161d2660220606653a0b5e97ac870c1da4f2cddee429fdaa23e5f47b541d4a3",
+      "output_tokens": 70,
+      "protocol_version": "g3-smoke-v1",
+      "provider_identity": "fixture-provider",
+      "result_ref": "result:parity:workbench",
+      "run_id": "run-parity-workbench",
+      "schema": "nexus.workbench.benchmark_run.v1",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "tool_actions": [
+        "repo.read:a",
+        "repo.read:b"
+      ],
+      "wall_time_ms": 850
+    },
+    {
+      "arm": "BASELINE",
+      "case_hash": "d0d2d408d5e0461df086b76b403147a94c02ca07918abda3dd4b137fb2a6ee9d",
+      "case_id": "smoke-root-cause",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ],
+      "input_tokens": 100,
+      "model_identity": "fixture-model-v1",
+      "model_settings_hash": "e161d2660220606653a0b5e97ac870c1da4f2cddee429fdaa23e5f47b541d4a3",
+      "output_tokens": 50,
+      "protocol_version": "g3-smoke-v1",
+      "provider_identity": "fixture-provider",
+      "result_ref": "result:root:baseline",
+      "run_id": "run-root-baseline",
+      "schema": "nexus.workbench.benchmark_run.v1",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "tool_actions": [
+        "repo.search:runtime",
+        "repo.read:service",
+        "repo.search:runtime"
+      ],
+      "wall_time_ms": 1000
+    },
+    {
+      "arm": "WORKBENCH",
+      "case_hash": "d0d2d408d5e0461df086b76b403147a94c02ca07918abda3dd4b137fb2a6ee9d",
+      "case_id": "smoke-root-cause",
+      "evidence_refs": [
+        "E1",
+        "E2",
+        "E3",
+        "E4"
+      ],
+      "input_tokens": 120,
+      "model_identity": "fixture-model-v1",
+      "model_settings_hash": "e161d2660220606653a0b5e97ac870c1da4f2cddee429fdaa23e5f47b541d4a3",
+      "output_tokens": 60,
+      "protocol_version": "g3-smoke-v1",
+      "provider_identity": "fixture-provider",
+      "result_ref": "result:root:workbench",
+      "run_id": "run-root-workbench",
+      "schema": "nexus.workbench.benchmark_run.v1",
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "tool_actions": [
+        "repo.search:runtime",
+        "repo.read:service",
+        "repo.read:identity"
+      ],
+      "wall_time_ms": 1100
+    }
+  ],
+  "schema": "nexus.workbench.benchmark_bundle.v1"
+}

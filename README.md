@@ -2,46 +2,34 @@
 
 Transport-neutral, non-authority executable workbench contracts for Nexus professional agents.
 
-Current status: **G2 isolated read-only repository executor**.
+Current status: **G3 deterministic A/B benchmark harness**.
 
 ## What exists
 
-G1 established:
+G1 established durable Notebook/Action/Observation/Candidate contracts, hash-bound persistence, and a transport-neutral Executor protocol.
 
-- `WorkbenchNotebook` — durable facts, hypotheses, plan/progress and evidence references outside chat history.
-- `ActionCell` — hash-bound, attributable executable proposal.
-- `ObservationBundle` — hash-bound executor outcome with explicit `OUTCOME_UNKNOWN` support.
-- `Executor` — transport-neutral protocol; no mandatory Dev MCP/DevSpace dependency.
-- `JsonWorkbenchStore` — atomic durable JSON persistence with integrity checks.
-- `Candidate` — evidence/result proposal whose claim ceiling is always `WORKBENCH_CANDIDATE_ONLY`.
+G2 added `LocalReadOnlyExecutor`, bound to one exact clean Git target and a physically disjoint scratch root, with fixed read-only repository probes and physical before/after readback.
 
-G2 adds `LocalReadOnlyExecutor`, bound to one exact clean Git target and a physically disjoint scratch root.
+G3 adds a deterministic, provider-neutral A/B benchmark harness:
 
-Its target-facing surface is deliberately fixed:
+- immutable benchmark cases;
+- BASELINE and WORKBENCH run traces;
+- external evaluator records bound to exact run hashes;
+- strict same-source/model/provider/settings fairness gates;
+- deterministic per-case and aggregate metrics;
+- canonical byte-stable JSON reports;
+- synthetic positive/negative smoke fixtures.
 
-- `repo.read`
-- `repo.search`
-- `git.status`
-- `git.diff`
-- `test.discover`
+Synthetic fixture results validate the harness only. They are not evidence that Workbench improves real engineering performance.
 
-`artifact.write` is allowed only in Workbench-owned scratch outside the target repository.
+## G3 benchmark CLI
 
-Every action compares before/after target HEAD, tree, Git status, and a physical worktree manifest that includes tracked, untracked, and ignored filesystem state while excluding only the worktree's top-level `.git` metadata.
+```bash
+PYTHONPATH=src python3 -m nexus_workbench.benchmark validate benchmarks/fixtures/smoke_bundle.json
+PYTHONPATH=src python3 -m nexus_workbench.benchmark report benchmarks/fixtures/smoke_bundle.json
+```
 
-## G2 safety boundary
-
-G2 fails closed on:
-
-- `EFFECTFUL` Action Cells;
-- unsupported or substituted capabilities;
-- absolute and parent path escapes;
-- symlink escapes;
-- dirty, moved, or otherwise stale target identity;
-- scratch roots that overlap the target;
-- any detected post-action target mutation.
-
-G2 does **not** expose arbitrary shell, arbitrary Python execution, repository test execution, source writes, Dev MCP/DevSpace integration, remote-host control, browser/GUI/vision, or completion authority.
+The report tracks root-cause correctness, completion, false conclusions, evidence coverage, tool calls, repeated actions, tokens and wall time. Correctness/completion come only from separate evaluator records; an agent cannot self-score through its run trace.
 
 See:
 
@@ -49,7 +37,8 @@ See:
 - [Authority boundary](docs/AUTHORITY_BOUNDARY.md)
 - [Workbench protocol](docs/WORKBENCH_PROTOCOL.md)
 - [G2 read-only executor](docs/G2_READ_ONLY_EXECUTOR.md)
-- [G2 Issue #6](https://github.com/James3014/nexus-workbench/issues/6)
+- [G3 benchmark harness](docs/G3_BENCHMARK_HARNESS.md)
+- [G3 Issue #10](https://github.com/James3014/nexus-workbench/issues/10)
 
 ## Verify
 
@@ -58,13 +47,16 @@ Requires Python 3.11+ and no runtime dependencies outside the standard library.
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m compileall -q src tests
+PYTHONPATH=src python3 -m nexus_workbench.benchmark validate benchmarks/fixtures/smoke_bundle.json
+PYTHONPATH=src python3 -m nexus_workbench.benchmark report benchmarks/fixtures/smoke_bundle.json >/tmp/g3-report.json
+cmp /tmp/g3-report.json benchmarks/fixtures/smoke_report.json
 git diff --check
 ```
 
 ## Claim ceiling
 
-Passing G2 verification supports only:
+Passing G3 verification supports only:
 
-`G2_READ_ONLY_EXECUTOR_CANARY_ONLY`
+`G3_BENCHMARK_HARNESS_VALIDATED_ONLY`
 
-It does not prove G3 cross-worker resume, G4 A/B effectiveness, mutation safety, integrated Nexus consumption, runtime deployment, or production readiness.
+It does not prove Workbench effectiveness on real Nexus tasks, G4 cross-worker resume, mutation safety, integrated Nexus consumption, runtime deployment, or production readiness.
