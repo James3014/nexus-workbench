@@ -580,9 +580,8 @@ class ResumeCoordinator:
 
     def resume(self, request: ResumeRequest) -> ResumeReceipt:
         try:
-            head = self.store.load_resume_head(request.workbench_session_id)
-            checkpoint = self.store.load_resume_checkpoint(
-                request.workbench_session_id, head.checkpoint_id
+            head, checkpoint = self.store.load_resume_state(
+                request.workbench_session_id
             )
         except FileNotFoundError as exc:
             raise ResumeBlocked("RESUME_STATE_MISSING", "resume head/checkpoint is missing") from exc
@@ -605,16 +604,6 @@ class ResumeCoordinator:
         if checkpoint.phase is ResumePhase.READY_FOR_ACTION:
             action = checkpoint.next_action
             assert action is not None
-            if self.store.action_exists(
-                checkpoint.workbench_session_id, action.step_id
-            ) or self.store.observation_exists(
-                checkpoint.workbench_session_id, action.step_id
-            ):
-                raise ResumeBlocked(
-                    "NEXT_STEP_ALREADY_MATERIALIZED",
-                    "next action step already has durable action/observation state; reconcile instead of replaying",
-                )
-
             claim = ResumeCheckpoint(
                 checkpoint_id=(
                     f"{checkpoint.checkpoint_id}.claim."
@@ -678,10 +667,8 @@ class ResumeCoordinator:
         expected_step_id: str,
     ) -> ResumeReceipt:
         try:
-            head = self.store.load_resume_head(request.workbench_session_id)
-            checkpoint = self.store.load_resume_checkpoint(
-                request.workbench_session_id,
-                head.checkpoint_id,
+            head, checkpoint = self.store.load_resume_state(
+                request.workbench_session_id
             )
         except FileNotFoundError as exc:
             raise ResumeBlocked(
@@ -701,6 +688,28 @@ class ResumeCoordinator:
         self._validate_lineage(checkpoint)
         notebook = self._load_bound_notebook(checkpoint)
         self._validate_references(checkpoint, notebook)
+
+        if checkpoint.phase is ResumePhase.READY_FOR_ACTION:
+            action = checkpoint.next_action
+            assert action is not None
+            if action.step_id != expected_step_id:
+                raise ResumeBlocked(
+                    "READY_CLAIM_CONFLICT",
+                    "READY head now names a different step",
+                )
+            if self.store.action_exists(
+                checkpoint.workbench_session_id, action.step_id
+            ) or self.store.observation_exists(
+                checkpoint.workbench_session_id, action.step_id
+            ):
+                raise ResumeBlocked(
+                    "NEXT_STEP_ALREADY_MATERIALIZED",
+                    "next action step already has durable action/observation state; reconcile instead of replaying",
+                )
+            raise ResumeBlocked(
+                "READY_CLAIM_CONFLICT",
+                "READY claim failed without a durable materialization",
+            )
 
         if checkpoint.phase in (
             ResumePhase.IN_FLIGHT,

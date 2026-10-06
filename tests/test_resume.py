@@ -508,6 +508,127 @@ class ReviewerRegressionTests(unittest.TestCase):
             fx.close()
 
 
+    def test_completed_observation_artifact_must_be_in_checkpoint_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JsonWorkbenchStore(Path(tmp))
+            coordinator = ResumeCoordinator(store)
+            s1 = action("S1")
+            obs1 = ObservationBundle(
+                workbench_session_id=SESSION,
+                step_id="S1",
+                action_hash=s1.content_hash,
+                executor_identity="fixture",
+                started_at="2026-10-06T12:00:00Z",
+                finished_at="2026-10-06T12:00:01Z",
+                outcome=ObservationOutcome.SUCCEEDED,
+                artifact_refs=("A-missing",),
+            )
+            notebook = WorkbenchNotebook(
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                goal="artifact lineage",
+                observation_refs=("S1",),
+                revision=1,
+            )
+            s2 = action("S2")
+            checkpoint = ResumeCheckpoint(
+                checkpoint_id="cp-artifact",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=1,
+                notebook_revision=1,
+                notebook_hash=notebook.content_hash,
+                phase=ResumePhase.READY_FOR_ACTION,
+                completed_step_ids=("S1",),
+                observation_refs=("S1",),
+                next_action=s2,
+            )
+            store.save_action(s1)
+            store.save_observation(obs1)
+            store.save_notebook(notebook)
+            with self.assertRaisesRegex(
+                ResumeBlocked, "OBSERVATION_ARTIFACT_LINEAGE_MISMATCH"
+            ):
+                coordinator.publish(checkpoint)
+
+    def test_terminal_transition_cannot_drop_prior_artifact_lineage(self) -> None:
+        fx = DurableFixture()
+        try:
+            first = fx.coordinator.resume(fx.request())
+            self.assertEqual(first.disposition, ResumeDisposition.READY_FOR_ACTION)
+            head = fx.store.load_resume_head(SESSION)
+            inflight = fx.store.load_resume_checkpoint(SESSION, head.checkpoint_id)
+            self.assertEqual(inflight.phase, ResumePhase.IN_FLIGHT)
+            fx.store.save_observation(observation(fx.s2))
+
+            revision2 = WorkbenchNotebook(
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                goal=fx.notebook.goal,
+                current_objective="complete",
+                next_probe="",
+                observation_refs=("S1", "S2"),
+                artifact_refs=(),
+                revision=2,
+            )
+            fx.store.save_notebook(revision2)
+            complete = ResumeCheckpoint(
+                checkpoint_id="cp-complete",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=inflight.sequence + 1,
+                previous_checkpoint_id=inflight.checkpoint_id,
+                previous_checkpoint_hash=inflight.checkpoint_hash,
+                notebook_revision=2,
+                notebook_hash=revision2.content_hash,
+                phase=ResumePhase.COMPLETE,
+                completed_step_ids=("S1", "S2"),
+                observation_refs=("S1", "S2"),
+                artifact_refs=(),
+            )
+            with self.assertRaisesRegex(ResumeBlocked, "ARTIFACT_LINEAGE_FORK"):
+                fx.coordinator.publish(complete)
+        finally:
+            fx.close()
+
+    def test_g4_checkpoint_rejects_effectful_action(self) -> None:
+        effectful = ActionCell(
+            workbench_session_id=SESSION,
+            step_id="S-effect",
+            notebook_revision=1,
+            intent="mutate source",
+            mode=ActionMode.EFFECTFUL,
+            requested_capabilities=("repo.write",),
+            code_or_action=json.dumps({"op": "repo.write"}),
+        )
+        with self.assertRaisesRegex(ValueError, "G4 rejects effectful"):
+            ResumeCheckpoint(
+                checkpoint_id="cp-effect",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=1,
+                notebook_revision=1,
+                notebook_hash="0" * 64,
+                phase=ResumePhase.READY_FOR_ACTION,
+                next_action=effectful,
+            )
+
+
 class CrossProcessResumeCanaryTests(unittest.TestCase):
     def test_killed_worker_resumes_in_fresh_process_without_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

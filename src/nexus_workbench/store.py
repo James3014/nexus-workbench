@@ -369,3 +369,14 @@ class JsonWorkbenchStore:
             self._path("resume-heads", workbench_session_id),
             ResumeHead.from_dict,
         )
+
+    def load_resume_state(
+        self, workbench_session_id: str
+    ) -> tuple[ResumeHead, ResumeCheckpoint]:
+        """Read the durable head and its checkpoint under the session lock."""
+        with self._session_lock(workbench_session_id):
+            head = self.load_resume_head(workbench_session_id)
+            checkpoint = self.load_resume_checkpoint(
+                workbench_session_id, head.checkpoint_id
+            )
+            return head, checkpoint
