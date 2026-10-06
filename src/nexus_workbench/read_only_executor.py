@@ -401,10 +401,16 @@ class LocalReadOnlyExecutor:
             for node in tree.body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
                     tests.append(f"{rel}::{node.name}")
-                elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                    for child in node.body:
-                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
-                            tests.append(f"{rel}::{node.name}::{child.name}")
+                elif isinstance(node, ast.ClassDef):
+                    is_unittest_case = any(
+                        (isinstance(base, ast.Name) and base.id == "TestCase")
+                        or (isinstance(base, ast.Attribute) and base.attr == "TestCase")
+                        for base in node.bases
+                    )
+                    if node.name.startswith("Test") or is_unittest_case:
+                        for child in node.body:
+                            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
+                                tests.append(f"{rel}::{node.name}::{child.name}")
         return {"files": files, "tests": tests, "parse_errors": parse_errors}
 
     def _artifact_write(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], str]:

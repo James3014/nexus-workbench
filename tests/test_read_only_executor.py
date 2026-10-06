@@ -42,9 +42,13 @@ class RepoFixture:
         tests = self.target / "tests"
         tests.mkdir()
         (tests / "test_safe.py").write_text(
+            "import unittest\n"
             "raise RuntimeError('test discovery must not import this module')\n\n"
             "def test_example():\n"
-            "    pass\n",
+            "    pass\n\n"
+            "class OddNamedSuite(unittest.TestCase):\n"
+            "    def test_class_case(self):\n"
+            "        pass\n",
             encoding="utf-8",
         )
         (self.target / "escape-link").symlink_to(self.outside)
@@ -121,6 +125,10 @@ class ReadOnlyExecutorCanaryTests(unittest.TestCase):
         )
         discovered = observations[4].physical_readback["result"]["tests"]
         self.assertIn("tests/test_safe.py::test_example", discovered)
+        self.assertIn(
+            "tests/test_safe.py::OddNamedSuite::test_class_case",
+            discovered,
+        )
 
     def test_artifact_write_is_confined_to_disjoint_scratch(self) -> None:
         observation = self.executor.execute(
