@@ -58,7 +58,7 @@ G4 introduces `ResumeCheckpoint`, `ResumeHead`, `ResumeReceipt`, and `ArtifactRe
 - Checkpoints bind exact session/task/operation/attempt/target identity, Notebook revision/hash, completed-step Observation lineage, Artifact lineage, phase, and next/in-flight Action Cell.
 - Resume head publication is serialized per session and compare-and-advances exact predecessor id/hash + sequence; stale writers and forks fail closed.
 - Notebook revisions advance monotonically; Action, Observation, and Artifact records are immutable-idempotent by durable identity.
-- `READY_FOR_ACTION` exposes only the exact durable next Action Cell if it has not already materialized.
+- `READY_FOR_ACTION` is emitted only after an atomic per-session claim materializes the exact Action Cell and advances the durable head to `IN_FLIGHT`; a lost race re-reads the durable head and returns reconciliation rather than duplicate READY work.
 - `IN_FLIGHT` and `RECONCILE_REQUIRED` resume only as reconciliation gates. `OUTCOME_UNKNOWN` is never retry permission.
 - Fresh worker/model labels are provenance on the receipt only; transcript, provider session, interpreter globals, and original model identity are not resume authority.
 

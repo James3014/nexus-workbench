@@ -191,13 +191,13 @@ class ResumeContractTests(unittest.TestCase):
             self.fx.store.save_notebook(self.fx.notebook)
 
     def test_missing_completed_observation_fails_closed(self) -> None:
-        path = self.fx.root / "observations" / f"{SESSION}--S1.json"
+        path = self.fx.root / "observations" / SESSION / "S1.json"
         path.unlink()
         with self.assertRaisesRegex(ResumeBlocked, "DURABLE_REFERENCE_MISSING"):
             self.fx.coordinator.resume(self.fx.request())
 
     def test_tampered_artifact_fails_closed(self) -> None:
-        path = self.fx.root / "artifacts" / f"{SESSION}--A1.json"
+        path = self.fx.root / "artifacts" / SESSION / "A1.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["payload"]["summary"] = "tampered"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -205,7 +205,7 @@ class ResumeContractTests(unittest.TestCase):
             self.fx.coordinator.resume(self.fx.request())
 
     def test_tampered_and_duplicate_key_checkpoint_fail_closed(self) -> None:
-        path = self.fx.root / "resume-checkpoints" / f"{SESSION}--cp-1.json"
+        path = self.fx.root / "resume-checkpoints" / SESSION / "cp-1.json"
         original = path.read_text(encoding="utf-8")
         payload = json.loads(original)
         payload["target_identity"] = "changed"
@@ -344,6 +344,168 @@ class ResumeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "ArtifactRecord is immutable"):
             self.fx.store.save_artifact(changed_artifact)
+
+
+class ReviewerRegressionTests(unittest.TestCase):
+    def test_durable_paths_do_not_alias_session_and_step_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JsonWorkbenchStore(Path(tmp))
+            left = ActionCell(
+                "a--b",
+                "S1",
+                1,
+                "left",
+                ActionMode.READ_ONLY_PROBE,
+                ("repo.read",),
+            )
+            right = ActionCell(
+                "a",
+                "b--S1",
+                1,
+                "right",
+                ActionMode.READ_ONLY_PROBE,
+                ("repo.read",),
+            )
+            store.save_action(left)
+            store.save_action(right)
+            self.assertEqual(store.load_action("a--b", "S1"), left)
+            self.assertEqual(store.load_action("a", "b--S1"), right)
+            self.assertNotEqual(
+                store._path("actions", "a--b", "S1"),
+                store._path("actions", "a", "b--S1"),
+            )
+
+    def test_reconciliation_cannot_substitute_inflight_action(self) -> None:
+        fx = DurableFixture()
+        try:
+            fx.store.save_action(fx.s2)
+            cp2 = ResumeCheckpoint(
+                checkpoint_id="cp-2",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=2,
+                previous_checkpoint_id=fx.cp1.checkpoint_id,
+                previous_checkpoint_hash=fx.cp1.checkpoint_hash,
+                notebook_revision=1,
+                notebook_hash=fx.notebook.content_hash,
+                phase=ResumePhase.IN_FLIGHT,
+                completed_step_ids=("S1",),
+                observation_refs=("S1",),
+                artifact_refs=("A1",),
+                active_action=fx.s2,
+            )
+            fx.coordinator.publish(cp2)
+            substituted = action("S3")
+            cp3 = ResumeCheckpoint(
+                checkpoint_id="cp-3",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=3,
+                previous_checkpoint_id=cp2.checkpoint_id,
+                previous_checkpoint_hash=cp2.checkpoint_hash,
+                notebook_revision=1,
+                notebook_hash=fx.notebook.content_hash,
+                phase=ResumePhase.RECONCILE_REQUIRED,
+                completed_step_ids=("S1",),
+                observation_refs=("S1",),
+                artifact_refs=("A1",),
+                active_action=substituted,
+            )
+            with self.assertRaisesRegex(ResumeBlocked, "ACTION_SUBSTITUTION"):
+                fx.coordinator.publish(cp3)
+        finally:
+            fx.close()
+
+    def test_competing_processes_cannot_both_receive_ready_claim(self) -> None:
+        fx = DurableFixture()
+        try:
+            barrier = fx.root / "start"
+            consumer = textwrap.dedent(
+                r"""
+                import json, sys, time
+                from pathlib import Path
+                from nexus_workbench import JsonWorkbenchStore, ResumeCoordinator, ResumeRequest
+
+                root = Path(sys.argv[1])
+                barrier = Path(sys.argv[2])
+                while not barrier.exists():
+                    time.sleep(0.001)
+                receipt = ResumeCoordinator(JsonWorkbenchStore(root)).resume(
+                    ResumeRequest(
+                        workbench_session_id="wb-g4",
+                        task_id="task-g4",
+                        operation_id="op-g4",
+                        attempt_id="attempt-g4",
+                        target_identity="git-tree:fixture-g4",
+                        resumer_identity=sys.argv[3],
+                        resumer_model_identity=sys.argv[4],
+                    )
+                )
+                print(json.dumps(receipt.to_dict(), sort_keys=True))
+                """
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        consumer,
+                        str(fx.root),
+                        str(barrier),
+                        "worker-race-A",
+                        "model-race-A",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=os.environ.copy(),
+                ),
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        consumer,
+                        str(fx.root),
+                        str(barrier),
+                        "worker-race-B",
+                        "model-race-B",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=os.environ.copy(),
+                ),
+            ]
+            barrier.write_text("go\n", encoding="utf-8")
+            results = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                results.append(json.loads(stdout))
+            dispositions = sorted(item["disposition"] for item in results)
+            self.assertEqual(
+                dispositions,
+                ["READY_FOR_ACTION", "RECONCILE_REQUIRED"],
+            )
+            ready = next(
+                item for item in results if item["disposition"] == "READY_FOR_ACTION"
+            )
+            reconcile = next(
+                item
+                for item in results
+                if item["disposition"] == "RECONCILE_REQUIRED"
+            )
+            self.assertEqual(ready["next_action"]["step_id"], "S2")
+            self.assertEqual(reconcile["reconcile_step_id"], "S2")
+            self.assertIsNone(reconcile["next_action"])
+        finally:
+            fx.close()
 
 
 class CrossProcessResumeCanaryTests(unittest.TestCase):

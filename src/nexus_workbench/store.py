@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, TypeVar
 
 from .model import ActionCell, Candidate, ObservationBundle, WorkbenchNotebook
-from .resume import ArtifactRecord, ResumeCheckpoint, ResumeHead
+from .resume import ArtifactRecord, ResumeCheckpoint, ResumeHead, ResumePhase
 
 T = TypeVar("T")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -43,8 +43,13 @@ class JsonWorkbenchStore:
 
     def _path(self, kind: str, *parts: str) -> Path:
         safe = [_safe_id(part, "state identity") for part in parts]
+        if not safe:
+            raise ValueError("state path requires at least one identity")
         directory = (self.root / kind).resolve()
-        path = (directory / ("--".join(safe) + ".json")).resolve()
+        path = directory
+        for part in safe[:-1]:
+            path = path / part
+        path = (path / f"{safe[-1]}.json").resolve()
         if not path.is_relative_to(directory):
             raise ValueError("state path escapes Workbench store")
         return path
@@ -281,6 +286,73 @@ class JsonWorkbenchStore:
             )
             self._write(head_path, head.to_dict())
             return path
+
+    def claim_ready_action(
+        self,
+        ready_checkpoint: ResumeCheckpoint,
+        inflight_checkpoint: ResumeCheckpoint,
+    ) -> Path:
+        """Atomically fence one READY action claim and advance the durable head.
+
+        Exactly one competing resumer can advance the bound READY checkpoint.
+        A crash after materializing the ActionCell but before head advancement
+        leaves durable evidence that blocks blind replay on the next resume.
+        """
+        session_id = ready_checkpoint.workbench_session_id
+        if inflight_checkpoint.workbench_session_id != session_id:
+            raise ValueError("resume claim session mismatch")
+        if inflight_checkpoint.phase is not ResumePhase.IN_FLIGHT:
+            raise ValueError("resume claim successor must be IN_FLIGHT")
+        action = inflight_checkpoint.active_action
+        if action is None:
+            raise ValueError("resume claim successor requires active_action")
+
+        head_path = self._path("resume-heads", session_id)
+        checkpoint_path = self._path(
+            "resume-checkpoints",
+            session_id,
+            inflight_checkpoint.checkpoint_id,
+        )
+        action_path = self._path("actions", session_id, action.step_id)
+
+        with self._session_lock(session_id):
+            head = self._read(head_path, ResumeHead.from_dict)
+            if (
+                head.checkpoint_id != ready_checkpoint.checkpoint_id
+                or head.checkpoint_hash != ready_checkpoint.checkpoint_hash
+                or head.sequence != ready_checkpoint.sequence
+            ):
+                raise ValueError("resume READY claim lost durable-head race")
+            if inflight_checkpoint.sequence != ready_checkpoint.sequence + 1:
+                raise ValueError("resume claim sequence is not current head + 1")
+            if (
+                inflight_checkpoint.previous_checkpoint_id
+                != ready_checkpoint.checkpoint_id
+                or inflight_checkpoint.previous_checkpoint_hash
+                != ready_checkpoint.checkpoint_hash
+            ):
+                raise ValueError("resume claim predecessor does not bind current head")
+            if action.workbench_session_id != session_id:
+                raise ValueError("resume claim action session mismatch")
+            if action.step_id in ready_checkpoint.completed_step_ids:
+                raise ValueError("resume claim action is already completed")
+            if action_path.exists() or self.observation_exists(session_id, action.step_id):
+                raise ValueError(
+                    "resume READY action already materialized; reconcile instead"
+                )
+            if checkpoint_path.exists():
+                raise ValueError("resume claim checkpoint already exists")
+
+            self._write(action_path, action.to_dict())
+            self._write(checkpoint_path, inflight_checkpoint.to_dict())
+            new_head = ResumeHead(
+                workbench_session_id=session_id,
+                checkpoint_id=inflight_checkpoint.checkpoint_id,
+                checkpoint_hash=inflight_checkpoint.checkpoint_hash,
+                sequence=inflight_checkpoint.sequence,
+            )
+            self._write(head_path, new_head.to_dict())
+            return checkpoint_path
 
     def load_resume_checkpoint(
         self, workbench_session_id: str, checkpoint_id: str

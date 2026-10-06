@@ -17,7 +17,7 @@ Current status: **G4 durable cross-worker resume**.
 - Checkpoints bind exact Notebook revision/hash plus completed Observation and Artifact lineage.
 - Notebook revisions advance monotonically.
 - Action, Observation, and Artifact records are immutable-idempotent by durable identity.
-- `READY_FOR_ACTION` may expose only the exact durable next Action Cell when it has not already materialized.
+- `READY_FOR_ACTION` is returned only after an atomic durable claim has materialized the exact Action Cell and advanced the session head to `IN_FLIGHT`; competing workers reconcile instead of receiving duplicate READY authority.
 - `IN_FLIGHT` and `OUTCOME_UNKNOWN` resume only as `RECONCILE_REQUIRED`; they never authorize blind replay.
 - Original transcript, provider session, model identity, process memory, and interpreter globals are not required for resume.
 

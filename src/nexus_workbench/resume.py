@@ -277,6 +277,10 @@ class ResumeCheckpoint:
             raise ValueError(f"{label} session does not match checkpoint")
         if action.notebook_revision != self.notebook_revision:
             raise ValueError(f"{label} notebook revision does not match checkpoint")
+        try:
+            action.assert_g1_allowed()
+        except ValueError as exc:
+            raise ValueError("G4 rejects effectful Action Cells") from exc
 
     def _body(self) -> dict[str, Any]:
         return {
@@ -610,9 +614,39 @@ class ResumeCoordinator:
                     "NEXT_STEP_ALREADY_MATERIALIZED",
                     "next action step already has durable action/observation state; reconcile instead of replaying",
                 )
+
+            claim = ResumeCheckpoint(
+                checkpoint_id=(
+                    f"{checkpoint.checkpoint_id}.claim."
+                    f"{checkpoint.sequence + 1}.{action.step_id}"
+                ),
+                workbench_session_id=checkpoint.workbench_session_id,
+                task_id=checkpoint.task_id,
+                operation_id=checkpoint.operation_id,
+                attempt_id=checkpoint.attempt_id,
+                target_identity=checkpoint.target_identity,
+                sequence=checkpoint.sequence + 1,
+                previous_checkpoint_id=checkpoint.checkpoint_id,
+                previous_checkpoint_hash=checkpoint.checkpoint_hash,
+                notebook_revision=checkpoint.notebook_revision,
+                notebook_hash=checkpoint.notebook_hash,
+                phase=ResumePhase.IN_FLIGHT,
+                completed_step_ids=checkpoint.completed_step_ids,
+                observation_refs=checkpoint.observation_refs,
+                artifact_refs=checkpoint.artifact_refs,
+                active_action=action,
+            )
+            self._validate_transition(checkpoint, claim)
+            try:
+                self.store.claim_ready_action(checkpoint, claim)
+            except ValueError:
+                return self._resume_after_claim_conflict(
+                    request,
+                    expected_step_id=action.step_id,
+                )
             return self._receipt(
                 request,
-                checkpoint,
+                claim,
                 notebook,
                 ResumeDisposition.READY_FOR_ACTION,
                 next_action=action,
@@ -635,6 +669,70 @@ class ResumeCoordinator:
 
         return self._receipt(
             request, checkpoint, notebook, ResumeDisposition.COMPLETE
+        )
+
+    def _resume_after_claim_conflict(
+        self,
+        request: ResumeRequest,
+        *,
+        expected_step_id: str,
+    ) -> ResumeReceipt:
+        try:
+            head = self.store.load_resume_head(request.workbench_session_id)
+            checkpoint = self.store.load_resume_checkpoint(
+                request.workbench_session_id,
+                head.checkpoint_id,
+            )
+        except FileNotFoundError as exc:
+            raise ResumeBlocked(
+                "READY_CLAIM_CONFLICT",
+                "durable state disappeared while reconciling READY claim",
+            ) from exc
+
+        if (
+            head.checkpoint_hash != checkpoint.checkpoint_hash
+            or head.sequence != checkpoint.sequence
+        ):
+            raise ResumeBlocked(
+                "READY_CLAIM_CONFLICT",
+                "durable head changed inconsistently while reconciling READY claim",
+            )
+        self._assert_request_identity(request, checkpoint)
+        self._validate_lineage(checkpoint)
+        notebook = self._load_bound_notebook(checkpoint)
+        self._validate_references(checkpoint, notebook)
+
+        if checkpoint.phase in (
+            ResumePhase.IN_FLIGHT,
+            ResumePhase.RECONCILE_REQUIRED,
+        ):
+            action = checkpoint.active_action
+            assert action is not None
+            if action.step_id != expected_step_id:
+                raise ResumeBlocked(
+                    "READY_CLAIM_CONFLICT",
+                    "competing claim advanced a different step",
+                )
+            self._assert_active_action(checkpoint, action)
+            return self._receipt(
+                request,
+                checkpoint,
+                notebook,
+                ResumeDisposition.RECONCILE_REQUIRED,
+                reconcile_step_id=action.step_id,
+            )
+
+        if checkpoint.phase is ResumePhase.COMPLETE:
+            return self._receipt(
+                request,
+                checkpoint,
+                notebook,
+                ResumeDisposition.COMPLETE,
+            )
+
+        raise ResumeBlocked(
+            "READY_CLAIM_CONFLICT",
+            "READY claim lost race without a reconcilable durable successor",
         )
 
     def _receipt(
@@ -722,10 +820,10 @@ class ResumeCoordinator:
                 "ARTIFACT_LINEAGE_MISMATCH",
                 "checkpoint artifact refs do not match notebook snapshot",
             )
-        if set(checkpoint.completed_step_ids) != set(checkpoint.observation_refs):
+        if tuple(checkpoint.completed_step_ids) != tuple(checkpoint.observation_refs):
             raise ResumeBlocked(
                 "COMPLETED_STEP_LINEAGE_MISMATCH",
-                "completed steps must exactly match durable observation refs",
+                "completed steps must exactly match ordered durable observation refs",
             )
 
         for step_id in checkpoint.completed_step_ids:
@@ -741,6 +839,26 @@ class ResumeCoordinator:
                     "DURABLE_REFERENCE_MISSING",
                     f"completed step {step_id} is missing action/observation state",
                 ) from exc
+            if (
+                action.workbench_session_id != checkpoint.workbench_session_id
+                or action.step_id != step_id
+                or observation.workbench_session_id != checkpoint.workbench_session_id
+                or observation.step_id != step_id
+            ):
+                raise ResumeBlocked(
+                    "DURABLE_REFERENCE_IDENTITY_MISMATCH",
+                    f"completed step {step_id} resolved to another durable identity",
+                )
+            if (
+                action.workbench_session_id != checkpoint.workbench_session_id
+                or action.step_id != step_id
+                or observation.workbench_session_id != checkpoint.workbench_session_id
+                or observation.step_id != step_id
+            ):
+                raise ResumeBlocked(
+                    "DURABLE_REFERENCE_IDENTITY_MISMATCH",
+                    f"completed step {step_id} durable records are bound to another identity",
+                )
             try:
                 observation.assert_binds(action)
             except ValueError as exc:
@@ -752,6 +870,14 @@ class ResumeCoordinator:
                 raise ResumeBlocked(
                     "OUTCOME_UNKNOWN_IN_COMPLETED_LINEAGE",
                     f"completed step {step_id} cannot have OUTCOME_UNKNOWN",
+                )
+            missing_artifact_lineage = sorted(
+                set(observation.artifact_refs) - set(checkpoint.artifact_refs)
+            )
+            if missing_artifact_lineage:
+                raise ResumeBlocked(
+                    "OBSERVATION_ARTIFACT_LINEAGE_MISMATCH",
+                    f"completed step {step_id} references artifacts absent from checkpoint lineage: {missing_artifact_lineage}",
                 )
 
         for artifact_id in checkpoint.artifact_refs:
@@ -847,6 +973,20 @@ class ResumeCoordinator:
                 "COMPLETED_STEP_FORK",
                 "completed-step lineage must be append-only and ordered",
             )
+        if tuple(current.observation_refs[: len(previous.observation_refs)]) != tuple(
+            previous.observation_refs
+        ):
+            raise ResumeBlocked(
+                "OBSERVATION_LINEAGE_FORK",
+                "observation lineage must preserve the previous ordered prefix",
+            )
+        if tuple(current.artifact_refs[: len(previous.artifact_refs)]) != tuple(
+            previous.artifact_refs
+        ):
+            raise ResumeBlocked(
+                "ARTIFACT_LINEAGE_FORK",
+                "artifact lineage must preserve the previous ordered prefix",
+            )
 
         if previous.phase is ResumePhase.READY_FOR_ACTION:
             expected = previous.next_action
@@ -917,6 +1057,12 @@ class ResumeCoordinator:
                     raise ResumeBlocked(
                         "RECONCILIATION_REQUIRED",
                         "unresolved in-flight action cannot advance to new work",
+                    )
+                assert current.active_action is not None
+                if current.active_action.content_hash != active.content_hash:
+                    raise ResumeBlocked(
+                        "ACTION_SUBSTITUTION",
+                        "reconciliation must preserve the exact in-flight action",
                     )
                 if current.completed_step_ids != previous.completed_step_ids:
                     raise ResumeBlocked(
