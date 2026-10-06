@@ -31,7 +31,7 @@ One external evaluation bound to an exact `run_hash`. It supplies root-cause cor
 
 A case is scored only when exactly one BASELINE and one WORKBENCH run exist and both have the same source revision, benchmark protocol version, model identity, provider identity, and model-settings hash.
 
-Duplicate arms, missing arms, stale case hashes, stale evaluator hashes, unknown evidence, source drift, protocol drift, duplicate JSON object keys, negative counters, or malformed schemas fail closed.
+Duplicate arms, missing arms, stale case hashes, stale evaluator hashes, unknown evidence, source drift, protocol drift, duplicate JSON object keys, negative counters, malformed schemas, or edge-whitespace on identity-bearing semantic payloads fail closed. G3 never trims such payloads before hashing.
 
 ## Metrics
 

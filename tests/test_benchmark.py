@@ -191,6 +191,39 @@ class BenchmarkHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkError, "case hash mismatch"):
             build_report(BenchmarkBundle.from_dict(raw))
 
+    def test_run_and_evaluator_payloads_reject_edge_whitespace_before_hashing(self) -> None:
+        run_mutations = [
+            ("tool_actions", lambda value: [value[0] + " ", *value[1:]]),
+            ("evidence_refs", lambda value: [" " + value[0], *value[1:]]),
+            ("result_ref", lambda value: value + " "),
+        ]
+        for field, mutate in run_mutations:
+            raw = load_raw()
+            raw["runs"][0][field] = mutate(raw["runs"][0][field])
+            with self.assertRaisesRegex(BenchmarkError, "leading or trailing whitespace"):
+                BenchmarkBundle.from_dict(raw)
+
+        raw = load_raw()
+        raw["evaluations"][0]["notes_ref"] += " "
+        with self.assertRaisesRegex(BenchmarkError, "leading or trailing whitespace"):
+            BenchmarkBundle.from_dict(raw)
+
+    def test_case_semantics_reject_edge_whitespace_before_hashing(self) -> None:
+        raw = load_raw()
+        raw["cases"][0]["task_input"] = "    " + raw["cases"][0]["task_input"]
+        with self.assertRaisesRegex(BenchmarkError, "leading or trailing whitespace"):
+            BenchmarkBundle.from_dict(raw)
+
+        raw = load_raw()
+        raw["cases"][0]["oracle_requirements"][0] += " "
+        with self.assertRaisesRegex(BenchmarkError, "leading or trailing whitespace"):
+            BenchmarkBundle.from_dict(raw)
+
+        raw = load_raw()
+        raw["cases"][0]["evidence_universe"][0] = " " + raw["cases"][0]["evidence_universe"][0]
+        with self.assertRaisesRegex(BenchmarkError, "leading or trailing whitespace"):
+            BenchmarkBundle.from_dict(raw)
+
     def test_duplicate_json_keys_fail_closed(self) -> None:
         original = FIXTURE.read_text(encoding="utf-8")
         mutated = original.replace(

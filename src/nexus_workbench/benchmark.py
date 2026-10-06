@@ -70,6 +70,14 @@ def _text(value: Any, label: str) -> str:
     return value.strip()
 
 
+def _exact_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BenchmarkError(f"{label} must be a non-empty string")
+    if value != value.strip():
+        raise BenchmarkError(f"{label} must not have leading or trailing whitespace")
+    return value
+
+
 def _sha40(value: Any, label: str) -> str:
     text = _text(value, label).lower()
     if not _SHA40_RE.fullmatch(text):
@@ -105,7 +113,7 @@ def _strings(
 ) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, list):
         raise BenchmarkError(f"{label} must be a list of strings")
-    result = tuple(_text(item, label) for item in value)
+    result = tuple(_exact_text(item, label) for item in value)
     if not allow_empty and not result:
         raise BenchmarkError(f"{label} must not be empty")
     if unique and len(result) != len(set(result)):
@@ -138,7 +146,7 @@ class BenchmarkCase:
         object.__setattr__(self, "source_repository", _text(self.source_repository, "source_repository"))
         object.__setattr__(self, "source_revision", _sha40(self.source_revision, "source_revision"))
         object.__setattr__(self, "protocol_version", _text(self.protocol_version, "protocol_version"))
-        object.__setattr__(self, "task_input", _text(self.task_input, "task_input"))
+        object.__setattr__(self, "task_input", _exact_text(self.task_input, "task_input"))
         oracle_requirements = tuple(self.oracle_requirements)
         evidence_universe = tuple(self.evidence_universe)
         if not oracle_requirements:
@@ -150,9 +158,9 @@ class BenchmarkCase:
         if len(evidence_universe) != len(set(evidence_universe)):
             raise BenchmarkError("evidence_universe must not contain duplicates")
         for value in oracle_requirements:
-            _text(value, "oracle_requirements")
+            _exact_text(value, "oracle_requirements")
         for value in evidence_universe:
-            _text(value, "evidence_universe")
+            _exact_text(value, "evidence_universe")
         object.__setattr__(self, "oracle_requirements", oracle_requirements)
         object.__setattr__(self, "evidence_universe", evidence_universe)
 
@@ -236,17 +244,17 @@ class BenchmarkRun:
         tool_actions = tuple(self.tool_actions)
         evidence_refs = tuple(self.evidence_refs)
         for value in tool_actions:
-            _text(value, "tool_actions")
+            _exact_text(value, "tool_actions")
         if len(evidence_refs) != len(set(evidence_refs)):
             raise BenchmarkError("evidence_refs must not contain duplicates")
         for value in evidence_refs:
-            _text(value, "evidence_refs")
+            _exact_text(value, "evidence_refs")
         object.__setattr__(self, "tool_actions", tool_actions)
         object.__setattr__(self, "evidence_refs", evidence_refs)
         object.__setattr__(self, "input_tokens", _nonnegative_int(self.input_tokens, "input_tokens"))
         object.__setattr__(self, "output_tokens", _nonnegative_int(self.output_tokens, "output_tokens"))
         object.__setattr__(self, "wall_time_ms", _nonnegative_int(self.wall_time_ms, "wall_time_ms"))
-        object.__setattr__(self, "result_ref", _text(self.result_ref, "result_ref"))
+        object.__setattr__(self, "result_ref", _exact_text(self.result_ref, "result_ref"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -326,7 +334,7 @@ class BenchmarkEvaluation:
             "false_conclusion_count",
             _nonnegative_int(self.false_conclusion_count, "false_conclusion_count"),
         )
-        object.__setattr__(self, "notes_ref", _text(self.notes_ref, "notes_ref"))
+        object.__setattr__(self, "notes_ref", _exact_text(self.notes_ref, "notes_ref"))
 
     def to_dict(self) -> dict[str, Any]:
         return {

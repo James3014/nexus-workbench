@@ -43,6 +43,7 @@ G3 introduces separate benchmark records:
 - `BenchmarkCase` freezes case provenance, source revision, protocol, exact task input, oracle requirements, and evidence universe; its canonical content defines `case_hash`.
 - `BenchmarkRun` binds that exact `case_hash` and records arm identity, model/provider/settings binding, ordered actions, evidence references, token counts, latency, and a result reference. It contains no correctness/completion fields.
 - `BenchmarkEvaluation` supplies external scoring and binds the exact run hash, which therefore transitively binds the frozen case.
+- Identity-bearing semantic payloads such as task input, oracle/evidence entries, action signatures, result references, and evaluator note references are never trim-normalized before hashing; edge whitespace is rejected fail-closed.
 - `BenchmarkBundle` pairs cases, runs, and evaluator records.
 - `build_report` refuses unfair or incomplete pairs and emits exact rational aggregate metrics plus per-case deltas.
 
