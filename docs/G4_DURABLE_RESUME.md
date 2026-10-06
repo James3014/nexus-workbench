@@ -25,7 +25,7 @@ Notebook writes are monotonic by revision. Action Cells, Observation Bundles, an
 
 ## Validation
 
-`ResumeCoordinator` reloads the durable head, complete checkpoint lineage, Notebook, completed Action/Observation pairs, and Artifact Records. It rejects stale or conflicting session/task/operation/attempt/target identity, Notebook revision/hash drift, missing references, action/observation substitution, ambiguous durable path identity, lineage gaps/forks, completed-step replay, tampered hashes, duplicate JSON keys, and any G4 `EFFECTFUL` Action. Artifact lineage is append-only, and every Artifact reference declared by a completed Observation must be present in the checkpoint/Notebook lineage and resolve durably.
+`ResumeCoordinator` reloads the durable head, complete checkpoint lineage, Notebook, completed Action/Observation pairs, and Artifact Records. It rejects stale or conflicting session/task/operation/attempt/target identity, Notebook revision/hash drift, missing references, action/observation substitution, ambiguous durable path identity, lineage gaps/forks, completed-step replay, tampered hashes, duplicate JSON keys, and any G4 `EFFECTFUL` Action. Artifact lineage is append-only; every Artifact reference declared by a completed Observation must be present in the checkpoint/Notebook lineage, resolve durably, and match the payload `artifact_id`. A READY claim re-reads and revalidates the bound Notebook revision/hash while holding the same per-session lock that fences Notebook writers and head advancement.
 
 Worker and model identities appear only on the resume receipt as provenance. They do not become durable task authority.
 

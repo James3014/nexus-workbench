@@ -889,10 +889,13 @@ class ResumeCoordinator:
                     "DURABLE_REFERENCE_MISSING",
                     f"artifact {artifact_id} is missing",
                 ) from exc
-            if artifact.workbench_session_id != checkpoint.workbench_session_id:
+            if (
+                artifact.workbench_session_id != checkpoint.workbench_session_id
+                or artifact.artifact_id != artifact_id
+            ):
                 raise ResumeBlocked(
                     "ARTIFACT_IDENTITY_MISMATCH",
-                    f"artifact {artifact_id} is bound to another session",
+                    f"artifact reference {artifact_id} does not match durable record identity",
                 )
 
     def _validate_lineage(self, checkpoint: ResumeCheckpoint) -> None:

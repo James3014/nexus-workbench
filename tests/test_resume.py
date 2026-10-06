@@ -629,6 +629,59 @@ class ReviewerRegressionTests(unittest.TestCase):
             )
 
 
+    def test_artifact_reference_binds_payload_artifact_id(self) -> None:
+        fx = DurableFixture()
+        try:
+            substituted = ArtifactRecord(
+                workbench_session_id=SESSION,
+                artifact_id="A2",
+                media_type="application/json",
+                payload={"summary": "valid but wrong identity"},
+            )
+            path = fx.root / "artifacts" / SESSION / "A1.json"
+            path.write_text(
+                json.dumps(substituted.to_dict(), sort_keys=True),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ResumeBlocked, "ARTIFACT_IDENTITY_MISMATCH"):
+                fx.coordinator.resume(fx.request())
+        finally:
+            fx.close()
+
+    def test_ready_claim_rechecks_notebook_inside_session_lock(self) -> None:
+        fx = DurableFixture()
+        try:
+            original_claim = fx.store.claim_ready_action
+
+            def claim_after_notebook_advance(
+                ready_checkpoint: ResumeCheckpoint,
+                inflight_checkpoint: ResumeCheckpoint,
+            ):
+                revision2 = WorkbenchNotebook(
+                    workbench_session_id=SESSION,
+                    task_id=TASK,
+                    operation_id=OPERATION,
+                    attempt_id=ATTEMPT,
+                    target_identity=TARGET,
+                    goal=fx.notebook.goal,
+                    current_objective="concurrent writer advanced notebook",
+                    next_probe="different durable continuation",
+                    observation_refs=("S1",),
+                    artifact_refs=("A1",),
+                    revision=2,
+                )
+                fx.store.save_notebook(revision2)
+                return original_claim(ready_checkpoint, inflight_checkpoint)
+
+            fx.store.claim_ready_action = claim_after_notebook_advance
+            with self.assertRaisesRegex(ResumeBlocked, "STALE_NOTEBOOK_REVISION"):
+                fx.coordinator.resume(fx.request())
+            self.assertFalse(fx.store.action_exists(SESSION, "S2"))
+            self.assertEqual(fx.store.load_resume_head(SESSION).checkpoint_id, "cp-1")
+        finally:
+            fx.close()
+
+
 class CrossProcessResumeCanaryTests(unittest.TestCase):
     def test_killed_worker_resumes_in_fresh_process_without_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

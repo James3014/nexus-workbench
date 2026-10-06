@@ -317,6 +317,30 @@ class JsonWorkbenchStore:
 
         with self._session_lock(session_id):
             head = self._read(head_path, ResumeHead.from_dict)
+            notebook = self._read(
+                self._path("notebooks", session_id),
+                WorkbenchNotebook.from_dict,
+            )
+            for field_name in (
+                "workbench_session_id",
+                "task_id",
+                "operation_id",
+                "attempt_id",
+                "target_identity",
+            ):
+                if getattr(notebook, field_name) != getattr(
+                    ready_checkpoint, field_name
+                ):
+                    raise ValueError(
+                        f"resume READY claim notebook {field_name} binding is stale"
+                    )
+            if (
+                notebook.revision != ready_checkpoint.notebook_revision
+                or notebook.content_hash != ready_checkpoint.notebook_hash
+            ):
+                raise ValueError(
+                    "resume READY claim notebook revision/hash binding is stale"
+                )
             if (
                 head.checkpoint_id != ready_checkpoint.checkpoint_id
                 or head.checkpoint_hash != ready_checkpoint.checkpoint_hash
