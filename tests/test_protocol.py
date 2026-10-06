@@ -56,6 +56,20 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "action hash"):
             obs.assert_binds(wrong)
 
+    def test_observation_rejects_substituted_session_and_step(self) -> None:
+        action = ActionCell("wb-1", "S1", 1, "inspect source", ActionMode.READ_ONLY_PROBE)
+        wrong_session = ObservationBundle(
+            "wb-2", "S1", action.content_hash, "fixture-executor", "2026-10-06T08:00:00Z", "2026-10-06T08:00:01Z", ObservationOutcome.SUCCEEDED
+        )
+        with self.assertRaisesRegex(ValueError, "session"):
+            wrong_session.assert_binds(action)
+
+        wrong_step = ObservationBundle(
+            "wb-1", "S2", action.content_hash, "fixture-executor", "2026-10-06T08:00:00Z", "2026-10-06T08:00:01Z", ObservationOutcome.SUCCEEDED
+        )
+        with self.assertRaisesRegex(ValueError, "step"):
+            wrong_step.assert_binds(action)
+
     def test_g1_rejects_effectful_action(self) -> None:
         action = ActionCell("wb-1", "S1", 1, "write source", ActionMode.EFFECTFUL, ("repo.write",))
         with self.assertRaisesRegex(ValueError, "rejects effectful"):
