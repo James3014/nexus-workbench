@@ -16,6 +16,11 @@ from .model import (
     ObservationOutcome,
     WorkbenchNotebook,
 )
+from .read_only_executor import (
+    LocalReadOnlyExecutor,
+    ReadOnlyPolicyError,
+    TargetSnapshot,
+)
 from .store import JsonWorkbenchStore
 
 __all__ = [
@@ -33,7 +38,10 @@ __all__ = [
     "JsonWorkbenchStore",
     "KnowledgeItem",
     "KnowledgeStatus",
+    "LocalReadOnlyExecutor",
     "ObservationBundle",
     "ObservationOutcome",
+    "ReadOnlyPolicyError",
+    "TargetSnapshot",
     "WorkbenchNotebook",
 ]
