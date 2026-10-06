@@ -10,6 +10,7 @@ from nexus_workbench.benchmark import (
     BenchmarkBundle,
     BenchmarkError,
     build_report,
+    load_bundle,
     render_report,
 )
 
@@ -104,6 +105,14 @@ class BenchmarkHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkError, "source revision mismatch"):
             build_report(BenchmarkBundle.from_dict(raw))
 
+    def test_run_is_bound_to_exact_frozen_case_hash(self) -> None:
+        raw = load_raw()
+        raw["cases"][0]["task_input"] = "changed frozen task"
+        raw["cases"][0]["oracle_requirements"] = ["different oracle"]
+        raw["cases"][0]["evidence_universe"].append("NEW-EVIDENCE")
+        with self.assertRaisesRegex(BenchmarkError, "case hash mismatch"):
+            build_report(BenchmarkBundle.from_dict(raw))
+
     def test_duplicate_or_missing_arm_is_rejected(self) -> None:
         raw = load_raw()
         duplicate = copy.deepcopy(raw["runs"][0])
@@ -171,6 +180,36 @@ class BenchmarkHarnessTests(unittest.TestCase):
             EXPECTED_REPORT.read_text(encoding="utf-8"),
         )
 
+    def test_case_semantics_are_bound_into_runs(self) -> None:
+        raw = load_raw()
+        raw["cases"][0]["task_input"] += " altered"
+        with self.assertRaisesRegex(BenchmarkError, "case hash mismatch"):
+            build_report(BenchmarkBundle.from_dict(raw))
+
+        raw = load_raw()
+        raw["cases"][0]["evidence_universe"].append("E-new")
+        with self.assertRaisesRegex(BenchmarkError, "case hash mismatch"):
+            build_report(BenchmarkBundle.from_dict(raw))
+
+    def test_duplicate_json_keys_fail_closed(self) -> None:
+        original = FIXTURE.read_text(encoding="utf-8")
+        mutated = original.replace(
+            '"root_cause_correct": true,',
+            '"root_cause_correct": false, "root_cause_correct": true,',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duplicate.json"
+            path.write_text(mutated, encoding="utf-8")
+            with self.assertRaisesRegex(BenchmarkError, "duplicate JSON key: root_cause_correct"):
+                load_bundle(path)
+
+    def test_malformed_nested_record_fails_with_benchmark_error(self) -> None:
+        raw = load_raw()
+        raw["runs"][0] = None
+        with self.assertRaisesRegex(BenchmarkError, "benchmark run must be an object"):
+            BenchmarkBundle.from_dict(raw)
+
     def test_direct_construction_freezes_sequence_inputs(self) -> None:
         from nexus_workbench.benchmark import (
             BenchmarkCase,
@@ -187,6 +226,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             source_repository="example/repo",
             source_revision="1" * 40,
             protocol_version="v1",
+            task_input="Inspect the immutable fixture.",
             oracle_requirements=requirements,
             evidence_universe=evidence,
         )
@@ -200,6 +240,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         run = BenchmarkRun(
             run_id="immutable-run",
             case_id=case.case_id,
+            case_hash=case.case_hash,
             arm="BASELINE",
             source_revision=case.source_revision,
             protocol_version=case.protocol_version,

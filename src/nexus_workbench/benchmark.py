@@ -46,11 +46,22 @@ def content_hash(value: Any) -> str:
 
 
 def _exact_keys(data: Mapping[str, Any], expected: set[str], label: str) -> None:
+    if not isinstance(data, Mapping):
+        raise BenchmarkError(f"{label} must be an object")
     actual = set(data)
     if actual != expected:
         raise BenchmarkError(
             f"{label} keys mismatch; extra={sorted(actual - expected)}, missing={sorted(expected - actual)}"
         )
+
+
+def _strict_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BenchmarkError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def _text(value: Any, label: str) -> str:
@@ -110,6 +121,7 @@ class BenchmarkCase:
     source_repository: str
     source_revision: str
     protocol_version: str
+    task_input: str
     oracle_requirements: tuple[str, ...]
     evidence_universe: tuple[str, ...]
     schema: str = CASE_SCHEMA
@@ -126,6 +138,7 @@ class BenchmarkCase:
         object.__setattr__(self, "source_repository", _text(self.source_repository, "source_repository"))
         object.__setattr__(self, "source_revision", _sha40(self.source_revision, "source_revision"))
         object.__setattr__(self, "protocol_version", _text(self.protocol_version, "protocol_version"))
+        object.__setattr__(self, "task_input", _text(self.task_input, "task_input"))
         oracle_requirements = tuple(self.oracle_requirements)
         evidence_universe = tuple(self.evidence_universe)
         if not oracle_requirements:
@@ -152,6 +165,7 @@ class BenchmarkCase:
             "source_repository": self.source_repository,
             "source_revision": self.source_revision,
             "protocol_version": self.protocol_version,
+            "task_input": self.task_input,
             "oracle_requirements": list(self.oracle_requirements),
             "evidence_universe": list(self.evidence_universe),
         }
@@ -164,7 +178,7 @@ class BenchmarkCase:
     def from_dict(cls, data: Mapping[str, Any]) -> "BenchmarkCase":
         expected = {
             "schema", "case_id", "category", "provenance_kind", "source_repository",
-            "source_revision", "protocol_version", "oracle_requirements", "evidence_universe",
+            "source_revision", "protocol_version", "task_input", "oracle_requirements", "evidence_universe",
         }
         _exact_keys(data, expected, "benchmark case")
         return cls(
@@ -175,6 +189,7 @@ class BenchmarkCase:
             source_repository=data["source_repository"],
             source_revision=data["source_revision"],
             protocol_version=data["protocol_version"],
+            task_input=data["task_input"],
             oracle_requirements=_strings(data["oracle_requirements"], "oracle_requirements", allow_empty=False),
             evidence_universe=_strings(data["evidence_universe"], "evidence_universe", allow_empty=False),
         )
@@ -184,6 +199,7 @@ class BenchmarkCase:
 class BenchmarkRun:
     run_id: str
     case_id: str
+    case_hash: str
     arm: str
     source_revision: str
     protocol_version: str
@@ -203,6 +219,7 @@ class BenchmarkRun:
             raise BenchmarkError("unsupported benchmark run schema")
         object.__setattr__(self, "run_id", _text(self.run_id, "run_id"))
         object.__setattr__(self, "case_id", _text(self.case_id, "case_id"))
+        object.__setattr__(self, "case_hash", _sha256(self.case_hash, "case_hash"))
         arm = _text(self.arm, "arm").upper()
         if arm not in _ARMS:
             raise BenchmarkError(f"unsupported arm: {arm}")
@@ -236,6 +253,7 @@ class BenchmarkRun:
             "schema": self.schema,
             "run_id": self.run_id,
             "case_id": self.case_id,
+            "case_hash": self.case_hash,
             "arm": self.arm,
             "source_revision": self.source_revision,
             "protocol_version": self.protocol_version,
@@ -257,7 +275,7 @@ class BenchmarkRun:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BenchmarkRun":
         expected = {
-            "schema", "run_id", "case_id", "arm", "source_revision", "protocol_version",
+            "schema", "run_id", "case_id", "case_hash", "arm", "source_revision", "protocol_version",
             "model_identity", "provider_identity", "model_settings_hash", "tool_actions",
             "evidence_refs", "input_tokens", "output_tokens", "wall_time_ms", "result_ref",
         }
@@ -266,6 +284,7 @@ class BenchmarkRun:
             schema=data["schema"],
             run_id=data["run_id"],
             case_id=data["case_id"],
+            case_hash=data["case_hash"],
             arm=data["arm"],
             source_revision=data["source_revision"],
             protocol_version=data["protocol_version"],
@@ -445,6 +464,8 @@ def build_report(bundle: BenchmarkBundle) -> dict[str, Any]:
         case = cases.get(run.case_id)
         if case is None:
             raise BenchmarkError(f"run references unknown case_id: {run.case_id}")
+        if run.case_hash != case.case_hash:
+            raise BenchmarkError(f"case hash mismatch for run {run.run_id}")
         if run.source_revision != case.source_revision:
             raise BenchmarkError(f"source revision mismatch for run {run.run_id}")
         if run.protocol_version != case.protocol_version:
@@ -566,7 +587,10 @@ def build_report(bundle: BenchmarkBundle) -> dict[str, Any]:
 
 def load_bundle(path: str | Path) -> BenchmarkBundle:
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_object_pairs,
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise BenchmarkError(f"unable to read benchmark bundle: {path}") from exc
     if not isinstance(raw, Mapping):

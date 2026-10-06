@@ -14,7 +14,8 @@
       "provenance_kind": "SYNTHETIC_FIXTURE",
       "schema": "nexus.workbench.benchmark_case.v1",
       "source_repository": "James3014/nexus-workbench",
-      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42"
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "task_input": "Reach the correct bounded conclusion from the declared read-only evidence."
     },
     {
       "case_id": "smoke-root-cause",
@@ -33,7 +34,8 @@
       "provenance_kind": "SYNTHETIC_FIXTURE",
       "schema": "nexus.workbench.benchmark_case.v1",
       "source_repository": "James3014/nexus-workbench",
-      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42"
+      "source_revision": "4d163eb7144161d02d77db3081e0fb4c735ccf42",
+      "task_input": "Diagnose the stale runtime identity and support the conclusion with the declared evidence."
     }
   ],
   "evaluations": [
@@ -43,7 +45,7 @@
       "false_conclusion_count": 0,
       "notes_ref": "eval:parity:baseline",
       "root_cause_correct": true,
-      "run_hash": "515527e3b988c3447f4dd8de57998df5bc890dfded68b66c299af940ba03897a",
+      "run_hash": "561945389cd05bbdb4cf51ddb71c739566e36703ef31df9b396bb036201c157e",
       "run_id": "run-parity-baseline",
       "schema": "nexus.workbench.benchmark_evaluation.v1",
       "task_complete": true
@@ -54,7 +56,7 @@
       "false_conclusion_count": 0,
       "notes_ref": "eval:parity:workbench",
       "root_cause_correct": true,
-      "run_hash": "f5dc725f7065ea627dea89136ca5cc48d371646204a86c9bf5298035db661e1a",
+      "run_hash": "bd88fea7b68f2d8ba5b13e7b9619f6ab3dabe5684beeb11b1177bad355df6c01",
       "run_id": "run-parity-workbench",
       "schema": "nexus.workbench.benchmark_evaluation.v1",
       "task_complete": true
@@ -65,7 +67,7 @@
       "false_conclusion_count": 1,
       "notes_ref": "eval:root:baseline",
       "root_cause_correct": false,
-      "run_hash": "22283469250b8c92722373d26ef21f3a0405721d157003de296e77ac45156fda",
+      "run_hash": "d206887c0a0d5d76736fb2b1e461bda048de5eb9d04dc223672b46cee740b04d",
       "run_id": "run-root-baseline",
       "schema": "nexus.workbench.benchmark_evaluation.v1",
       "task_complete": false
@@ -76,7 +78,7 @@
       "false_conclusion_count": 0,
       "notes_ref": "eval:root:workbench",
       "root_cause_correct": true,
-      "run_hash": "de7e98cbec361bd8e7d5fecf7448a0c5bb98852dd1561eb46276acfc4d51543c",
+      "run_hash": "7b474c58809670a7062c53b038ffa563814b7b84eb72cfbf9373d17b365e49f0",
       "run_id": "run-root-workbench",
       "schema": "nexus.workbench.benchmark_evaluation.v1",
       "task_complete": true
@@ -85,6 +87,7 @@
   "runs": [
     {
       "arm": "BASELINE",
+      "case_hash": "878024b1cb0785f39a4622cf83fe8949fb6effe9d70aa76bdca6e1c7473e9981",
       "case_id": "smoke-parity",
       "evidence_refs": [
         "E5",
@@ -108,6 +111,7 @@
     },
     {
       "arm": "WORKBENCH",
+      "case_hash": "878024b1cb0785f39a4622cf83fe8949fb6effe9d70aa76bdca6e1c7473e9981",
       "case_id": "smoke-parity",
       "evidence_refs": [
         "E5",
@@ -131,6 +135,7 @@
     },
     {
       "arm": "BASELINE",
+      "case_hash": "d0d2d408d5e0461df086b76b403147a94c02ca07918abda3dd4b137fb2a6ee9d",
       "case_id": "smoke-root-cause",
       "evidence_refs": [
         "E1",
@@ -155,6 +160,7 @@
     },
     {
       "arm": "WORKBENCH",
+      "case_hash": "d0d2d408d5e0461df086b76b403147a94c02ca07918abda3dd4b137fb2a6ee9d",
       "case_id": "smoke-root-cause",
       "evidence_refs": [
         "E1",

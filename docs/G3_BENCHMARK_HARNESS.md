@@ -15,11 +15,11 @@ The harness owns comparison mechanics only. It does not run providers, judge its
 
 ### BenchmarkCase
 
-One frozen task definition bound to case id/category, provenance kind, source repository + exact Git revision, protocol version, oracle requirements, and a finite evidence universe.
+One frozen task definition bound to case id/category, provenance kind, source repository + exact Git revision, protocol version, frozen `task_input`, oracle requirements, and a finite evidence universe. The canonical `case_hash` covers all of those fields.
 
 ### BenchmarkRun
 
-One arm trace bound to the exact case/source/protocol plus model identity, provider identity, model-settings hash, ordered tool/action signatures, evidence references, token counts, wall time, and a result reference.
+One arm trace bound to the exact `case_hash`, source/protocol, model identity, provider identity, model-settings hash, ordered tool/action signatures, evidence references, token counts, wall time, and a result reference. Changing the task input, oracle, or evidence universe invalidates the run-to-case binding.
 
 The run schema intentionally has no correctness/completion/self-score fields.
 
@@ -31,7 +31,7 @@ One external evaluation bound to an exact `run_hash`. It supplies root-cause cor
 
 A case is scored only when exactly one BASELINE and one WORKBENCH run exist and both have the same source revision, benchmark protocol version, model identity, provider identity, and model-settings hash.
 
-Duplicate arms, missing arms, stale evaluator hashes, unknown evidence, source drift, protocol drift, negative counters, or malformed schemas fail closed.
+Duplicate arms, missing arms, stale case hashes, stale evaluator hashes, unknown evidence, source drift, protocol drift, duplicate JSON object keys, negative counters, or malformed schemas fail closed.
 
 ## Metrics
 
