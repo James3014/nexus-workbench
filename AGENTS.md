@@ -8,17 +8,17 @@ This repository owns a non-authority executable-workbench protocol and its stand
 - Workbench may consume externally supplied task/scope/effect authority, preserve or narrow it, and produce Candidate/evidence artifacts only.
 - Dev MCP/DevSpace must not be a mandatory dependency of the core protocol.
 - Provider/session/connector identity is carrier evidence, never durable task authority.
-- Benchmark evaluator records are evidence about a run, not Nexus completion/acceptance authority.
+- Resume worker/model identity is provenance only; it never replaces task/operation/attempt authority.
 
 ## Current gate
 
-G3 only: deterministic A/B benchmark harness on top of the G1 protocol/persistence skeleton and G2 isolated read-only repository executor.
+G4 only: durable cross-worker resume on top of G1 protocol/persistence, G2 isolated read-only execution, and G3 deterministic benchmarking.
 
-G3 may define immutable benchmark cases, BASELINE/WORKBENCH run traces, external evaluator records, fairness gates, deterministic metrics, and canonical reports.
+G4 may define immutable resume checkpoints, durable heads, resume receipts, artifact records, monotonic Notebook persistence, immutable Action/Observation records, reconciliation-only handling for unresolved in-flight work, and fresh-process kill/restart canaries.
 
-G3 does not authorize live provider orchestration, source mutation, arbitrary shell/Python, repository test execution, Dev MCP/DevSpace dependency, remote-host/browser/vision execution, G4 durable cross-worker resume, or any Nexus authority expansion.
+G4 does not authorize source mutation, arbitrary shell/Python, repository test execution by the product, live provider orchestration, Dev MCP/DevSpace dependency, remote-host/browser/vision execution, Nexus verification/completion authority, release/deployment, or production rollout.
 
-Synthetic fixture results validate the harness only. They must never be cited as Workbench effectiveness evidence.
+`OUTCOME_UNKNOWN` is never retry permission. A resumed in-flight step must reconcile the same durable identity before any successor work.
 
 ## Verification
 

@@ -51,6 +51,19 @@ The accepted pair requires the same source revision, protocol version, model ide
 
 Synthetic fixture reports always remain under `G3_BENCHMARK_HARNESS_VALIDATED_ONLY`; they are not effectiveness evidence.
 
+## G4 durable resume contract
+
+G4 introduces `ResumeCheckpoint`, `ResumeHead`, `ResumeReceipt`, and `ArtifactRecord`.
+
+- Checkpoints bind exact session/task/operation/attempt/target identity, Notebook revision/hash, completed-step Observation lineage, Artifact lineage, phase, and next/in-flight Action Cell.
+- Resume head publication is serialized per session and compare-and-advances exact predecessor id/hash + sequence; stale writers and forks fail closed.
+- Notebook revisions advance monotonically; Action, Observation, and Artifact records are immutable-idempotent by durable identity.
+- `READY_FOR_ACTION` exposes only the exact durable next Action Cell if it has not already materialized.
+- `IN_FLIGHT` and `RECONCILE_REQUIRED` resume only as reconciliation gates. `OUTCOME_UNKNOWN` is never retry permission.
+- Fresh worker/model labels are provenance on the receipt only; transcript, provider session, interpreter globals, and original model identity are not resume authority.
+
+The G4 claim ceiling is `G4_DURABLE_RESUME_CANARY_ONLY`.
+
 ## Candidate
 
 A proposed result/evidence package. Its immutable maximum claim is `WORKBENCH_CANDIDATE_ONLY`; model prose cannot promote it.

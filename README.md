@@ -2,34 +2,26 @@
 
 Transport-neutral, non-authority executable workbench contracts for Nexus professional agents.
 
-Current status: **G3 deterministic A/B benchmark harness**.
+Current status: **G4 durable cross-worker resume**.
 
 ## What exists
 
-G1 established durable Notebook/Action/Observation/Candidate contracts, hash-bound persistence, and a transport-neutral Executor protocol.
+- **G1**: durable Notebook/Action/Observation/Candidate contracts and transport-neutral executor protocol.
+- **G2**: isolated local read-only repository executor with physical before/after target readback.
+- **G3**: deterministic provider-neutral A/B benchmark harness with external evaluator records and strict fairness gates.
+- **G4**: durable resume checkpoints and a fresh-process resume coordinator that reconstructs the next gate from persisted state rather than chat/model memory.
 
-G2 added `LocalReadOnlyExecutor`, bound to one exact clean Git target and a physically disjoint scratch root, with fixed read-only repository probes and physical before/after readback.
+## G4 resume invariants
 
-G3 adds a deterministic, provider-neutral A/B benchmark harness:
+- Resume is bound to exact session/task/operation/attempt/target identity.
+- Checkpoints bind exact Notebook revision/hash plus completed Observation and Artifact lineage.
+- Notebook revisions advance monotonically.
+- Action, Observation, and Artifact records are immutable-idempotent by durable identity.
+- `READY_FOR_ACTION` may expose only the exact durable next Action Cell when it has not already materialized.
+- `IN_FLIGHT` and `OUTCOME_UNKNOWN` resume only as `RECONCILE_REQUIRED`; they never authorize blind replay.
+- Original transcript, provider session, model identity, process memory, and interpreter globals are not required for resume.
 
-- immutable benchmark cases;
-- BASELINE and WORKBENCH run traces;
-- external evaluator records bound to exact run hashes;
-- strict same-source/model/provider/settings fairness gates;
-- deterministic per-case and aggregate metrics;
-- canonical byte-stable JSON reports;
-- synthetic positive/negative smoke fixtures.
-
-Synthetic fixture results validate the harness only. They are not evidence that Workbench improves real engineering performance.
-
-## G3 benchmark CLI
-
-```bash
-PYTHONPATH=src python3 -m nexus_workbench.benchmark validate benchmarks/fixtures/smoke_bundle.json
-PYTHONPATH=src python3 -m nexus_workbench.benchmark report benchmarks/fixtures/smoke_bundle.json
-```
-
-The report tracks root-cause correctness, completion, false conclusions, evidence coverage, tool calls, repeated actions, tokens and wall time. Correctness/completion come only from separate evaluator records; an agent cannot self-score through its run trace.
+The G4 kill/restart canary terminates a producer process and resumes from a separate process with different worker/model labels while keeping the target fixture unchanged.
 
 See:
 
@@ -38,7 +30,8 @@ See:
 - [Workbench protocol](docs/WORKBENCH_PROTOCOL.md)
 - [G2 read-only executor](docs/G2_READ_ONLY_EXECUTOR.md)
 - [G3 benchmark harness](docs/G3_BENCHMARK_HARNESS.md)
-- [G3 Issue #10](https://github.com/James3014/nexus-workbench/issues/10)
+- [G4 durable resume](docs/G4_DURABLE_RESUME.md)
+- [G4 Issue #12](https://github.com/James3014/nexus-workbench/issues/12)
 
 ## Verify
 
@@ -55,8 +48,8 @@ git diff --check
 
 ## Claim ceiling
 
-Passing G3 verification supports only:
+Passing G4 verification supports only:
 
-`G3_BENCHMARK_HARNESS_VALIDATED_ONLY`
+`G4_DURABLE_RESUME_CANARY_ONLY`
 
-It does not prove Workbench effectiveness on real Nexus tasks, G4 cross-worker resume, mutation safety, integrated Nexus consumption, runtime deployment, or production readiness.
+It does not prove Workbench effectiveness, effectful mutation safety, remote execution, integrated Nexus consumption, runtime deployment, or production readiness.
