@@ -31,7 +31,7 @@ See:
 - [G2 read-only executor](docs/G2_READ_ONLY_EXECUTOR.md)
 - [G3 benchmark harness](docs/G3_BENCHMARK_HARNESS.md)
 - [G4 durable resume](docs/G4_DURABLE_RESUME.md)
-- [G4 Issue #12](https://github.com/James3014/nexus-workbench/issues/12)
+- [G4 Issue #13](https://github.com/James3014/nexus-workbench/issues/13)
 
 ## Verify
 
