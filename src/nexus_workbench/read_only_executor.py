@@ -128,11 +128,10 @@ class LocalReadOnlyExecutor:
     """
 
     def __init__(self, target_root: Path, scratch_root: Path, baseline: TargetSnapshot) -> None:
-        self.target_root = target_root
-        self.scratch_root = scratch_root
-        self.baseline = baseline
-        digest = hashlib.sha256(str(target_root).encode("utf-8")).hexdigest()[:16]
-        self._identity = f"local-readonly-v1:{digest}"
+        # Direct construction would skip bind()'s checks and use an unresolved identity.
+        raise ReadOnlyPolicyError(
+            "LocalReadOnlyExecutor must be created with LocalReadOnlyExecutor.bind(target_root, scratch_root)"
+        )
 
     @classmethod
     def bind(cls, target_root: str | os.PathLike[str], scratch_root: str | os.PathLike[str]) -> "LocalReadOnlyExecutor":
