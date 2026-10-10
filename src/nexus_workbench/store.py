@@ -46,6 +46,8 @@ class JsonWorkbenchStore:
         if not safe:
             raise ValueError("state path requires at least one identity")
         directory = (self.root / kind).resolve()
+        if not directory.is_relative_to(self.root):
+            raise ValueError("state path escapes Workbench store")
         path = directory
         for part in safe[:-1]:
             path = path / part
@@ -57,6 +59,8 @@ class JsonWorkbenchStore:
     def _lock_path(self, workbench_session_id: str) -> Path:
         session = _safe_id(workbench_session_id, "workbench_session_id")
         directory = (self.root / "locks").resolve()
+        if not directory.is_relative_to(self.root):
+            raise ValueError("lock path escapes Workbench store")
         path = (directory / f"{session}.lock").resolve()
         if not path.is_relative_to(directory):
             raise ValueError("lock path escapes Workbench store")
@@ -347,6 +351,37 @@ class JsonWorkbenchStore:
                 or head.sequence != ready_checkpoint.sequence
             ):
                 raise ValueError("resume READY claim lost durable-head race")
+            if ready_checkpoint.phase is not ResumePhase.READY_FOR_ACTION:
+                raise ValueError("resume claim source must be READY_FOR_ACTION")
+            durable_ready = self._read(
+                self._path("resume-checkpoints", session_id, ready_checkpoint.checkpoint_id),
+                ResumeCheckpoint.from_dict,
+            )
+            if durable_ready != ready_checkpoint:
+                raise ValueError("resume claim source differs from durable checkpoint")
+            for field_name in ("task_id", "operation_id", "attempt_id", "target_identity"):
+                if getattr(inflight_checkpoint, field_name) != getattr(
+                    ready_checkpoint, field_name
+                ):
+                    raise ValueError(f"resume claim identity mismatch: {field_name}")
+            for field_name in (
+                "notebook_revision",
+                "notebook_hash",
+                "completed_step_ids",
+                "observation_refs",
+                "artifact_refs",
+            ):
+                if getattr(inflight_checkpoint, field_name) != getattr(
+                    ready_checkpoint, field_name
+                ):
+                    raise ValueError(f"resume claim lineage mismatch: {field_name}")
+            expected_action = ready_checkpoint.next_action
+            if (
+                expected_action is None
+                or action.step_id != expected_action.step_id
+                or action.content_hash != expected_action.content_hash
+            ):
+                raise ValueError("resume claim action substitution")
             if inflight_checkpoint.sequence != ready_checkpoint.sequence + 1:
                 raise ValueError("resume claim sequence is not current head + 1")
             if (
