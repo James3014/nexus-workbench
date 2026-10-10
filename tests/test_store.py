@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nexus_workbench import ActionCell, ActionMode, Candidate, JsonWorkbenchStore, WorkbenchNotebook
+from nexus_workbench import ActionCell, ActionMode, ArtifactRecord, Candidate, JsonWorkbenchStore, WorkbenchNotebook
 
 
 class StoreTests(unittest.TestCase):
@@ -48,6 +48,31 @@ class StoreTests(unittest.TestCase):
             store = JsonWorkbenchStore(Path(tmp))
             with self.assertRaisesRegex(ValueError, "unsafe path"):
                 store.load_notebook("../escape")
+
+    def test_store_rejects_symlinked_artifacts_directory_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "artifacts").symlink_to(outside, target_is_directory=True)
+            store = JsonWorkbenchStore(root)
+            artifact = ArtifactRecord("wb-1", "A1", "application/json", {"ok": True})
+            with self.assertRaisesRegex(ValueError, "escapes Workbench store"):
+                store.save_artifact(artifact)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_store_rejects_symlinked_locks_directory_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "locks").symlink_to(outside, target_is_directory=True)
+            store = JsonWorkbenchStore(root)
+            with self.assertRaisesRegex(ValueError, "escapes Workbench store"):
+                store.save_notebook(self.make_notebook())
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_action_and_candidate_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -375,6 +375,72 @@ class ReviewerRegressionTests(unittest.TestCase):
                 store._path("actions", "a", "b--S1"),
             )
 
+    def test_atomic_ready_claim_rejects_substituted_action_before_write(self) -> None:
+        fx = DurableFixture()
+        try:
+            substitute = action("S2", intent="different S2 action")
+            inflight = ResumeCheckpoint(
+                checkpoint_id="cp-2",
+                workbench_session_id=SESSION,
+                task_id=TASK,
+                operation_id=OPERATION,
+                attempt_id=ATTEMPT,
+                target_identity=TARGET,
+                sequence=2,
+                previous_checkpoint_id=fx.cp1.checkpoint_id,
+                previous_checkpoint_hash=fx.cp1.checkpoint_hash,
+                notebook_revision=1,
+                notebook_hash=fx.notebook.content_hash,
+                phase=ResumePhase.IN_FLIGHT,
+                completed_step_ids=("S1",),
+                observation_refs=("S1",),
+                artifact_refs=("A1",),
+                active_action=substitute,
+            )
+            with self.assertRaisesRegex(ValueError, "action substitution"):
+                fx.store.claim_ready_action(fx.cp1, inflight)
+            self.assertFalse(fx.store.action_exists(SESSION, "S2"))
+            self.assertFalse((fx.root / "resume-checkpoints" / SESSION / "cp-2.json").exists())
+            self.assertEqual(fx.store.load_resume_head(SESSION).checkpoint_id, "cp-1")
+        finally:
+            fx.close()
+
+    def test_atomic_ready_claim_rejects_changed_identity_and_lineage(self) -> None:
+        fx = DurableFixture()
+        try:
+            for alteration in (
+                {"task_id": "different-task"},
+                {"artifact_refs": ()},
+            ):
+                with self.subTest(alteration=alteration):
+                    values = dict(
+                        checkpoint_id="cp-2",
+                        workbench_session_id=SESSION,
+                        task_id=TASK,
+                        operation_id=OPERATION,
+                        attempt_id=ATTEMPT,
+                        target_identity=TARGET,
+                        sequence=2,
+                        previous_checkpoint_id=fx.cp1.checkpoint_id,
+                        previous_checkpoint_hash=fx.cp1.checkpoint_hash,
+                        notebook_revision=1,
+                        notebook_hash=fx.notebook.content_hash,
+                        phase=ResumePhase.IN_FLIGHT,
+                        completed_step_ids=("S1",),
+                        observation_refs=("S1",),
+                        artifact_refs=("A1",),
+                        active_action=fx.s2,
+                    )
+                    values.update(alteration)
+                    inflight = ResumeCheckpoint(**values)
+                    with self.assertRaisesRegex(ValueError, "identity|lineage"):
+                        fx.store.claim_ready_action(fx.cp1, inflight)
+                    self.assertFalse(fx.store.action_exists(SESSION, "S2"))
+                    self.assertFalse((fx.root / "resume-checkpoints" / SESSION / "cp-2.json").exists())
+                    self.assertEqual(fx.store.load_resume_head(SESSION).checkpoint_id, "cp-1")
+        finally:
+            fx.close()
+
     def test_reconciliation_cannot_substitute_inflight_action(self) -> None:
         fx = DurableFixture()
         try:
