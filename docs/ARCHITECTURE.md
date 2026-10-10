@@ -52,3 +52,22 @@ The physical target fingerprint includes:
 This makes prompt-level "read only" insufficient by design: G2 requires physical readback.
 
 Process-local interpreter state remains reconstructible cache. Durable Notebook/Action/Observation/Candidate data remains explicit state and does not become Nexus completion authority.
+
+
+G4 adds an append-only durable continuation chain:
+
+```text
+Notebook / Action / Observation / Artifact
+            |
+            v
+   ResumeCheckpoint + ResumeHead
+            |
+            v
+      ResumeCoordinator
+            |
+            +--> READY_FOR_ACTION: exact durable next Action Cell
+            +--> RECONCILE_REQUIRED: same in-flight step only
+            +--> COMPLETE: no successor work
+```
+
+Checkpoint publication is serialized per Workbench session and binds predecessor id/hash, Notebook revision/hash, completed Observation lineage, Artifact records, and exact task/operation/attempt/target identity. Process memory, interpreter globals, provider sessions, and chat history remain disposable cache. `OUTCOME_UNKNOWN` never authorizes replay.
