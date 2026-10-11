@@ -146,6 +146,17 @@ class BenchmarkHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkError, "evaluation run_hash mismatch"):
             build_report(BenchmarkBundle.from_dict(raw))
 
+    def test_evaluator_identity_matching_agent_identity_is_rejected(self) -> None:
+        # An agent (model or provider) must not grade its own run.
+        for field in ("model_identity", "provider_identity"):
+            with self.subTest(field=field):
+                raw = load_raw()
+                run = raw["runs"][0]
+                evaluation = next(item for item in raw["evaluations"] if item["run_id"] == run["run_id"])
+                evaluation["evaluator_identity"] = run[field]
+                with self.assertRaisesRegex(BenchmarkError, "must not equal its agent identity"):
+                    build_report(BenchmarkBundle.from_dict(raw))
+
     def test_evidence_outside_case_universe_is_rejected(self) -> None:
         raw = load_raw()
         raw["runs"][0]["evidence_refs"].append("NOT-IN-CASE")

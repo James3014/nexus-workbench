@@ -501,6 +501,12 @@ def build_report(bundle: BenchmarkBundle) -> dict[str, Any]:
             raise BenchmarkError(f"duplicate evaluation for run {evaluation.run_id}")
         if evaluation.run_hash != run.run_hash:
             raise BenchmarkError(f"evaluation run_hash mismatch for run {evaluation.run_id}")
+        # The agent under test is carried by its model and provider identity; it must not grade itself.
+        agent_identities = {run.model_identity.casefold(), run.provider_identity.casefold()}
+        if evaluation.evaluator_identity.casefold() in agent_identities:
+            raise BenchmarkError(
+                f"evaluator_identity for run {evaluation.run_id} must not equal its agent identity"
+            )
         evaluations_by_run[evaluation.run_id] = evaluation
 
     if set(evaluations_by_run) != set(runs_by_id):
