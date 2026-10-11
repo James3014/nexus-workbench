@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any, Mapping
 
-from .model import ActionCell, ObservationOutcome, WorkbenchNotebook
+from .model import ActionCell, ObservationBundle, ObservationOutcome, WorkbenchNotebook
 
 ARTIFACT_SCHEMA = "nexus.workbench.artifact_record.v1"
 RESUME_CHECKPOINT_SCHEMA = "nexus.workbench.resume_checkpoint.v1"
@@ -816,6 +816,40 @@ class ResumeCoordinator:
             )
         return notebook
 
+    @staticmethod
+    def _assert_observation_target(
+        target_identity: str, step_id: str, observation: ObservationBundle
+    ) -> None:
+        """Executor-produced observations must be bound to the session target.
+
+        An observation whose physical readback names a baseline identity (or that
+        was produced by the local read-only executor, which always records one)
+        is accepted only when that identity equals the checkpoint target_identity.
+        """
+
+        readback = observation.physical_readback
+        baseline = readback.get("baseline") if isinstance(readback, Mapping) else None
+        executor_produced = baseline is not None or observation.executor_identity.startswith(
+            "local-readonly-v1:"
+        )
+        if not executor_produced:
+            return
+        identities = []
+        if isinstance(baseline, Mapping):
+            identities.append(baseline.get("identity"))
+            for phase in ("before", "after"):
+                snapshot = readback.get(phase)
+                if isinstance(snapshot, Mapping):
+                    identities.append(snapshot.get("identity"))
+        if not identities or any(
+            not isinstance(identity, str) or identity != target_identity
+            for identity in identities
+        ):
+            raise ResumeBlocked(
+                "OBSERVATION_TARGET_IDENTITY_MISMATCH",
+                f"step {step_id} observation is not bound to the checkpoint target identity",
+            )
+
     def _validate_references(
         self, checkpoint: ResumeCheckpoint, notebook: WorkbenchNotebook
     ) -> None:
@@ -865,6 +899,9 @@ class ResumeCoordinator:
                     "ACTION_OBSERVATION_BINDING_MISMATCH",
                     f"completed step {step_id} has mismatched action/observation evidence",
                 ) from exc
+            self._assert_observation_target(
+                checkpoint.target_identity, step_id, observation
+            )
             if observation.outcome is ObservationOutcome.OUTCOME_UNKNOWN:
                 raise ResumeBlocked(
                     "OUTCOME_UNKNOWN_IN_COMPLETED_LINEAGE",
@@ -1053,6 +1090,9 @@ class ResumeCoordinator:
                         "ACTION_OBSERVATION_BINDING_MISMATCH",
                         "in-flight observation does not bind active action",
                     ) from exc
+                self._assert_observation_target(
+                    previous.target_identity, active.step_id, observation
+                )
 
             if observation is None or observation.outcome is ObservationOutcome.OUTCOME_UNKNOWN:
                 if current.phase is not ResumePhase.RECONCILE_REQUIRED:

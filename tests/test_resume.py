@@ -876,5 +876,116 @@ class CrossProcessResumeCanaryTests(unittest.TestCase):
             self.assertEqual(target_file.read_text(encoding="utf-8"), "immutable target\n")
 
 
+class ObservationTargetBindingTests(unittest.TestCase):
+    """Issue #21: executor-produced observations must bind the checkpoint target_identity."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = JsonWorkbenchStore(Path(self.temp.name))
+        self.coordinator = ResumeCoordinator(self.store)
+
+    def _executor_observation(self, cell, *, baseline=TARGET, executor="local-readonly-v1:x", **extra):
+        readback = {"baseline": {"identity": baseline}, "before": {"identity": baseline},
+                    "after": {"identity": baseline}}
+        readback.update(extra)
+        return ObservationBundle(
+            workbench_session_id=SESSION,
+            step_id=cell.step_id,
+            action_hash=cell.content_hash,
+            executor_identity=executor,
+            started_at="2026-10-06T12:00:00Z",
+            finished_at="2026-10-06T12:00:01Z",
+            outcome=ObservationOutcome.SUCCEEDED,
+            physical_readback=readback,
+        )
+
+    def _notebook(self, refs=(), revision=1):
+        nb = WorkbenchNotebook(
+            workbench_session_id=SESSION, task_id=TASK, operation_id=OPERATION,
+            attempt_id=ATTEMPT, target_identity=TARGET, goal="bind target",
+            observation_refs=refs, revision=revision,
+        )
+        self.store.save_notebook(nb)
+        return nb
+
+    def _checkpoint(self, cp_id, nb, **kw):
+        return ResumeCheckpoint(
+            checkpoint_id=cp_id, workbench_session_id=SESSION, task_id=TASK,
+            operation_id=OPERATION, attempt_id=ATTEMPT, target_identity=TARGET,
+            notebook_revision=nb.revision, notebook_hash=nb.content_hash, **kw,
+        )
+
+    def _completed_lineage_checkpoint(self, obs_factory):
+        s1 = action("S1")
+        self.store.save_action(s1)
+        self.store.save_observation(obs_factory(s1))
+        nb = self._notebook(refs=("S1",))
+        return self._checkpoint(
+            "cp-1", nb, sequence=1, phase=ResumePhase.READY_FOR_ACTION,
+            completed_step_ids=("S1",), observation_refs=("S1",), next_action=action("S2"),
+        )
+
+    def test_matching_executor_baseline_is_accepted(self) -> None:
+        cp = self._completed_lineage_checkpoint(lambda c: self._executor_observation(c))
+        self.coordinator.publish(cp)
+        receipt = self.coordinator.resume(ResumeRequest(
+            workbench_session_id=SESSION, task_id=TASK, operation_id=OPERATION,
+            attempt_id=ATTEMPT, target_identity=TARGET, resumer_identity="w",
+            resumer_model_identity="m"))
+        self.assertEqual(receipt.disposition, ResumeDisposition.READY_FOR_ACTION)
+
+    def test_completed_lineage_with_foreign_baseline_is_rejected(self) -> None:
+        cp = self._completed_lineage_checkpoint(
+            lambda c: self._executor_observation(c, baseline="git-tree:other-repo"))
+        with self.assertRaisesRegex(ResumeBlocked, "OBSERVATION_TARGET_IDENTITY_MISMATCH"):
+            self.coordinator.publish(cp)
+
+    def test_foreign_before_or_after_snapshot_is_rejected(self) -> None:
+        def factory(cell):
+            obs = self._executor_observation(cell)
+            readback = dict(obs.physical_readback)
+            readback["after"] = {"identity": "git-tree:other-repo"}
+            return ObservationBundle(**{**obs.__dict__, "physical_readback": readback})
+        cp = self._completed_lineage_checkpoint(factory)
+        with self.assertRaisesRegex(ResumeBlocked, "OBSERVATION_TARGET_IDENTITY_MISMATCH"):
+            self.coordinator.publish(cp)
+
+    def test_executor_observation_with_stripped_baseline_is_rejected(self) -> None:
+        def factory(cell):
+            obs = self._executor_observation(cell)
+            return ObservationBundle(**{**obs.__dict__, "physical_readback": {}})
+        cp = self._completed_lineage_checkpoint(factory)
+        with self.assertRaisesRegex(ResumeBlocked, "OBSERVATION_TARGET_IDENTITY_MISMATCH"):
+            self.coordinator.publish(cp)
+
+    def _inflight_then_complete(self, baseline):
+        s1 = action("S1")
+        self.store.save_action(s1)
+        nb1 = self._notebook()
+        cp1 = self._checkpoint("cp-1", nb1, sequence=1, phase=ResumePhase.READY_FOR_ACTION,
+                               next_action=s1)
+        self.coordinator.publish(cp1)
+        cp2 = self._checkpoint("cp-2", nb1, sequence=2, previous_checkpoint_id=cp1.checkpoint_id,
+                               previous_checkpoint_hash=cp1.checkpoint_hash,
+                               phase=ResumePhase.IN_FLIGHT, active_action=s1)
+        self.coordinator.publish(cp2)
+        self.store.save_observation(self._executor_observation(s1, baseline=baseline))
+        nb2 = self._notebook(refs=("S1",), revision=2)
+        return self._checkpoint(
+            "cp-3", nb2, sequence=3, previous_checkpoint_id=cp2.checkpoint_id,
+            previous_checkpoint_hash=cp2.checkpoint_hash, phase=ResumePhase.COMPLETE,
+            completed_step_ids=("S1",), observation_refs=("S1",),
+        )
+
+    def test_inflight_to_terminal_with_foreign_baseline_is_rejected(self) -> None:
+        cp3 = self._inflight_then_complete("git-tree:other-repo")
+        with self.assertRaisesRegex(ResumeBlocked, "OBSERVATION_TARGET_IDENTITY_MISMATCH"):
+            self.coordinator.publish(cp3)
+
+    def test_inflight_to_terminal_with_matching_baseline_is_accepted(self) -> None:
+        self.coordinator.publish(self._inflight_then_complete(TARGET))
+
+
 if __name__ == "__main__":
     unittest.main()
