@@ -44,6 +44,10 @@ G2 blocks before target execution when:
 
 After every action, G2 re-reads the target fingerprint. Any physical delta converts an otherwise successful action to `FAILED` and records changed target paths.
 
+## Target size limit
+
+The target fingerprint walks and hashes every file in the worktree except `.git`. `bind()` does it once and `execute()` does it twice per action. G2 refuses a target with more than 50,000 manifest entries (files, directories, symlinks) or more than 512 MiB of file content, with `ReadOnlyPolicyError` ("target exceeds G2 manifest limit"). `bind()` refuses such a target; `execute()` raises the same error, with no Observation, if the target grows past the limit after binding.
+
 ## Why tests are discovery-only
 
 Running repository tests is arbitrary code execution and can mutate files, processes, network state, caches, or external systems. G2 therefore exposes AST-only `test.discover`, not `pytest`, shell, or Python execution.

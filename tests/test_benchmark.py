@@ -337,6 +337,17 @@ class BenchmarkHarnessTests(unittest.TestCase):
             )
             self.assertEqual(main(["validate", str(FIXTURE)]), 0)
 
+    def test_effectiveness_claim_is_pinned_false_until_a_real_campaign(self) -> None:
+        # Pinned schema value. Making it True is a report schema change and
+        # needs the rule in docs/G3_BENCHMARK_HARNESS.md "Effectiveness claim":
+        # non-synthetic cases, independent evaluation, and a new schema id.
+        report = build_report(BenchmarkBundle.from_dict(load_raw()))
+        self.assertIs(report["effectiveness_claim_allowed"], False)
+        self.assertEqual(report["schema"], "nexus.workbench.benchmark_report.v1")
+        doc = (ROOT / "docs" / "G3_BENCHMARK_HARNESS.md").read_text(encoding="utf-8")
+        self.assertIn("## Effectiveness claim", doc)
+        self.assertIn("`effectiveness_claim_allowed`", doc)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,9 +4,12 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 from nexus_workbench import ActionCell, ActionMode, ObservationOutcome
+from nexus_workbench import read_only_executor
 from nexus_workbench.read_only_executor import LocalReadOnlyExecutor, ReadOnlyPolicyError
 
 
@@ -306,6 +309,41 @@ class ReadOnlyExecutorCanaryTests(unittest.TestCase):
         via_link = LocalReadOnlyExecutor.bind(link, self.fixture.root / "scratch-via-link")
         self.assertEqual(via_link.identity, self.executor.identity)
         self.assertEqual(via_link.target_identity, self.executor.target_identity)
+
+
+class ManifestLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RepoFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def test_fixture_manifest_stays_under_documented_limits(self) -> None:
+        started = time.monotonic()
+        entries = read_only_executor._manifest(self.fixture.target)
+        elapsed = time.monotonic() - started
+        file_bytes = sum(int(value.split(":")[2]) for value in entries.values() if value.startswith("F:"))
+        self.assertEqual(len(entries), 5)
+        self.assertLess(len(entries), read_only_executor._MAX_MANIFEST_ENTRIES)
+        self.assertLess(file_bytes, read_only_executor._MAX_MANIFEST_BYTES)
+        # Generous ceiling: a five-entry fixture must not take seconds.
+        self.assertLess(elapsed, 2.0)
+
+    def test_bind_refuses_target_over_entry_limit(self) -> None:
+        with mock.patch.object(read_only_executor, "_MAX_MANIFEST_ENTRIES", 3):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "manifest limit of 3 entries"):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_refuses_target_over_byte_limit(self) -> None:
+        with mock.patch.object(read_only_executor, "_MAX_MANIFEST_BYTES", 10):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "manifest limit of 10 file bytes"):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_execute_fails_closed_when_target_grows_past_limit(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with mock.patch.object(read_only_executor, "_MAX_MANIFEST_ENTRIES", 3):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "manifest limit"):
+                executor.execute(action("S1", "repo.read", path="README.md"))
 
 
 if __name__ == "__main__":
