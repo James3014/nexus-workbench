@@ -294,6 +294,19 @@ class ReadOnlyExecutorCanaryTests(unittest.TestCase):
         self.assertFalse(nested.exists())
         self.assertEqual(self.executor.snapshot().identity, before.identity)
 
+    def test_direct_construction_bypassing_bind_is_refused(self) -> None:
+        # The constructor skips bind()'s exact-worktree, clean-target and
+        # disjoint-scratch checks, so it must not yield an executor.
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "bind"):
+            LocalReadOnlyExecutor(self.fixture.target, self.fixture.scratch, self.baseline)
+
+    def test_identity_is_the_same_for_every_spelling_of_one_target(self) -> None:
+        link = self.fixture.root / "target-link"
+        link.symlink_to(self.fixture.target, target_is_directory=True)
+        via_link = LocalReadOnlyExecutor.bind(link, self.fixture.root / "scratch-via-link")
+        self.assertEqual(via_link.identity, self.executor.identity)
+        self.assertEqual(via_link.target_identity, self.executor.target_identity)
+
 
 if __name__ == "__main__":
     unittest.main()
