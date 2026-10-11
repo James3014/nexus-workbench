@@ -22,6 +22,10 @@ _ALLOWED_SCRATCH_OPS = frozenset({"artifact.write"})
 _MAX_READ_BYTES = 1_000_000
 _MAX_SEARCH_RESULTS = 200
 _MAX_ARTIFACT_BYTES = 1_000_000
+# Every snapshot walks and hashes the whole target, twice per action. These
+# ceilings bound that cost; a larger target is refused, not partially hashed.
+_MAX_MANIFEST_ENTRIES = 50_000
+_MAX_MANIFEST_BYTES = 512 * 1024 * 1024
 
 
 class ReadOnlyPolicyError(ValueError):
@@ -68,6 +72,19 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _manifest(root: Path) -> dict[str, str]:
     result: dict[str, str] = {}
+    hashed_bytes = 0
+
+    def admit(size: int) -> None:
+        nonlocal hashed_bytes
+        hashed_bytes += size
+        if len(result) >= _MAX_MANIFEST_ENTRIES:
+            raise ReadOnlyPolicyError(
+                f"target exceeds G2 manifest limit of {_MAX_MANIFEST_ENTRIES} entries"
+            )
+        if hashed_bytes > _MAX_MANIFEST_BYTES:
+            raise ReadOnlyPolicyError(
+                f"target exceeds G2 manifest limit of {_MAX_MANIFEST_BYTES} file bytes"
+            )
 
     def visit(directory: Path) -> None:
         entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
@@ -78,6 +95,7 @@ def _manifest(root: Path) -> dict[str, str]:
             rel = path.relative_to(root).as_posix()
             info = entry.stat(follow_symlinks=False)
             mode = stat.S_IMODE(info.st_mode)
+            admit(info.st_size if entry.is_file(follow_symlinks=False) else 0)
             if entry.is_symlink():
                 result[rel] = f"L:{mode:o}:{os.readlink(path)}"
                 continue

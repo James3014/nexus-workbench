@@ -59,3 +59,17 @@ Its numerical deltas are not Workbench effectiveness evidence.
 `G3_BENCHMARK_HARNESS_VALIDATED_ONLY`
 
 G3 does not prove that Workbench beats the baseline. A later real benchmark campaign must populate historical/frozen cases and independently evaluated runs before any performance claim.
+
+## Effectiveness claim
+
+`build_report` always sets `effectiveness_claim_allowed` to `false`, and `nexus.workbench.benchmark_report.v1` has no way to set it to `true`. Before it can be `true`:
+
+- the bundle must contain non-synthetic, historical or frozen cases (`contains_synthetic_cases` is `false`);
+- every run must be scored by an evaluator independent of the agent under test;
+- the report must move to a new schema id, with the rule that sets the flag written here and tested.
+
+`tests/test_benchmark.py` pins the current value.
+
+## Consumers
+
+No other repository imports `nexus_workbench` yet. The report schema and the executor's cost model are tested only by this repository's own tests.
