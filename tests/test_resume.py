@@ -987,5 +987,75 @@ class ObservationTargetBindingTests(unittest.TestCase):
         self.coordinator.publish(self._inflight_then_complete(TARGET))
 
 
+class RealExecutorTargetBindingTests(unittest.TestCase):
+    """Issue #21 reproducer: a real LocalReadOnlyExecutor bound to another repo."""
+
+    def setUp(self) -> None:
+        from nexus_workbench.read_only_executor import LocalReadOnlyExecutor
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.tmp = Path(self.temp.name)
+        self.repo_a = self._repo("A", "repo A\n")
+        self.repo_b = self._repo("B", "repo B (wrong target)\n")
+        self.ex_a = LocalReadOnlyExecutor.bind(self.repo_a, self.tmp / "scratchA")
+        self.ex_b = LocalReadOnlyExecutor.bind(self.repo_b, self.tmp / "scratchB")
+        self.target = self.ex_a.target_identity
+        self.store = JsonWorkbenchStore(self.tmp / "store")
+        self.co = ResumeCoordinator(self.store)
+
+    def _repo(self, name: str, text: str) -> Path:
+        root = self.tmp / name
+        root.mkdir()
+        (root / "README.md").write_text(text)
+        for c in (["init", "-q"], ["add", "."],
+                  ["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "i"]):
+            subprocess.run(["git", *c], cwd=root, check=True)
+        return root
+
+    def _run(self, executor) -> ResumeCheckpoint:
+        ident = dict(task_id="t", operation_id="o", attempt_id="a", target_identity=self.target)
+        s1 = ActionCell(workbench_session_id=SESSION, step_id="S1", notebook_revision=1,
+                        intent="read readme", mode=ActionMode.READ_ONLY_PROBE,
+                        requested_capabilities=("repo.read",),
+                        code_or_action=json.dumps({"op": "repo.read", "path": "README.md"}))
+        nb1 = WorkbenchNotebook(workbench_session_id=SESSION, goal="inspect", revision=1, **ident)
+        self.store.save_notebook(nb1)
+        cp1 = ResumeCheckpoint(checkpoint_id="cp-1", workbench_session_id=SESSION, sequence=1,
+                               notebook_revision=1, notebook_hash=nb1.content_hash,
+                               phase=ResumePhase.READY_FOR_ACTION, next_action=s1, **ident)
+        self.co.publish(cp1)
+        self.request = ResumeRequest(workbench_session_id=SESSION, resumer_identity="w",
+                                     resumer_model_identity="m", **ident)
+        receipt = self.co.resume(self.request)
+        self.store.save_observation(executor.execute(receipt.next_action))
+        nb2 = WorkbenchNotebook(workbench_session_id=SESSION, goal="inspect",
+                                observation_refs=("S1",), revision=2, **ident)
+        self.store.save_notebook(nb2)
+        _, inflight = self.store.load_resume_state(SESSION)
+        return ResumeCheckpoint(
+            checkpoint_id="cp-3", workbench_session_id=SESSION, sequence=inflight.sequence + 1,
+            previous_checkpoint_id=inflight.checkpoint_id,
+            previous_checkpoint_hash=inflight.checkpoint_hash, notebook_revision=2,
+            notebook_hash=nb2.content_hash, phase=ResumePhase.COMPLETE,
+            completed_step_ids=("S1",), observation_refs=("S1",), **ident)
+
+    def test_executor_bound_to_wrong_repo_cannot_complete_session(self) -> None:
+        cp3 = self._run(self.ex_b)
+        with self.assertRaisesRegex(ResumeBlocked, "OBSERVATION_TARGET_IDENTITY_MISMATCH"):
+            self.co.publish(cp3)
+        try:
+            final = self.co.resume(self.request)
+        except ResumeBlocked:
+            return
+        self.assertIsNot(final.disposition, ResumeDisposition.COMPLETE)
+
+    def test_executor_bound_to_session_target_completes(self) -> None:
+        cp3 = self._run(self.ex_a)
+        self.co.publish(cp3)
+        final = self.co.resume(self.request)
+        self.assertIs(final.disposition, ResumeDisposition.COMPLETE)
+
+
 if __name__ == "__main__":
     unittest.main()
