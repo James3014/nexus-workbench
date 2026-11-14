@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 from nexus_workbench import (
     G4_CLAIM_CEILING,
@@ -993,6 +994,9 @@ class RealExecutorTargetBindingTests(unittest.TestCase):
     def setUp(self) -> None:
         from nexus_workbench.read_only_executor import LocalReadOnlyExecutor
 
+        self.git_config = mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": os.devnull})
+        self.git_config.start()
+        self.addCleanup(self.git_config.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.tmp = Path(self.temp.name)

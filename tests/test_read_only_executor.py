@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -34,6 +35,8 @@ def git(root: Path, *args: str) -> str:
 
 class RepoFixture:
     def __init__(self) -> None:
+        self.git_config_env = mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": os.devnull})
+        self.git_config_env.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.target = self.root / "target"
@@ -67,6 +70,7 @@ class RepoFixture:
 
     def close(self) -> None:
         self.temp.cleanup()
+        self.git_config_env.stop()
 
 
 def action(
@@ -466,8 +470,9 @@ class ManifestLimitTests(unittest.TestCase):
                 executor._git("rev-parse", "--show-toplevel")
         self.assertTrue(recorded)
         for env in recorded:
-            for key in poisoned:
+            for key in poisoned.keys() - {"GIT_CONFIG_COUNT"}:
                 self.assertNotIn(key, env)
+        self.assertNotEqual(recorded[-1].get("GIT_CONFIG_COUNT"), "1")
 
     def test_bind_rejects_grafts(self) -> None:
         info = self.fixture.target / ".git" / "info"
@@ -483,6 +488,139 @@ class ManifestLimitTests(unittest.TestCase):
         (info / "alternates").write_text(str(self.fixture.outside.parent) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(ReadOnlyPolicyError, "alternate"):
             LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_symlinked_git_metadata_files(self) -> None:
+        head = self.fixture.target / ".git" / "HEAD"
+        external = self.fixture.root / "external-head"
+        head.rename(external)
+        head.symlink_to(external)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_hardlinked_git_config(self) -> None:
+        config = self.fixture.target / ".git" / "config"
+        external = self.fixture.root / "external-config"
+        os.link(config, external)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "hard.link|hardlink"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_config_at_any_scope(self) -> None:
+        git(self.fixture.target, "config", "diff.hostile.textconv", "touch /tmp/workbench-pwned")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_global_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            global_config = Path(tmp) / "gitconfig"
+            subprocess.run(["git", "config", "--file", str(global_config), "filter.hostile.smudge", "hostile"],
+                           check=True, capture_output=True)
+            with mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": str(global_config)}):
+                with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_system_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system_config = Path(tmp) / "gitconfig"
+            subprocess.run(["git", "config", "--file", str(system_config), "core.fsmonitor", "hostile"],
+                           check=True, capture_output=True)
+            with mock.patch.dict("os.environ", {"GIT_CONFIG_SYSTEM": str(system_config)}):
+                with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_each_execution_capable_config_family(self) -> None:
+        keys = (
+            "filter.hostile.process", "filter.hostile.clean", "filter.hostile.smudge",
+            "diff.hostile.command", "core.fsmonitor", "core.hooksPath", "include.path",
+            "includeIf.gitdir:/tmp/.path", "extensions.worktreeConfig",
+        )
+        for index, key in enumerate(keys):
+            with self.subTest(key=key):
+                fixture = RepoFixture()
+                try:
+                    value = "true" if key == "extensions.worktreeConfig" else "/tmp/hostile"
+                    git(fixture.target, "config", key, value)
+                    with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+                        LocalReadOnlyExecutor.bind(fixture.target, fixture.scratch)
+                finally:
+                    fixture.close()
+
+    def test_git_invocation_overrides_execution_capable_config(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        recorded: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            if args and isinstance(args[0], list) and args[0] and args[0][0] == sys.executable:
+                recorded.append(dict(kwargs.get("env") or {}))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+            executor._git("rev-parse", "HEAD")
+        self.assertTrue(recorded)
+        env = recorded[-1]
+        self.assertEqual(env.get("GIT_CONFIG_NOSYSTEM"), "1")
+        self.assertEqual(env.get("GIT_CONFIG_GLOBAL"), os.devnull)
+        self.assertGreaterEqual(int(env.get("GIT_CONFIG_COUNT", "0")), 10)
+        values = [env.get(f"GIT_CONFIG_KEY_{i}", "") + "=" + env.get(f"GIT_CONFIG_VALUE_{i}", "")
+                  for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))]
+        self.assertIn("core.sshCommand=", values)
+        self.assertIn("credential.helper=", values)
+        self.assertIn("protocol.ext.allow=never", values)
+        for setting in (
+            "core.fsmonitor=false", "core.hooksPath=/dev/null", "core.pager=cat",
+            "core.editor=", "core.askPass=", "diff.external=", "include.path=/dev/null",
+            "includeIf.gitdir:/__nexus_workbench_never__/.path=/dev/null",
+        ):
+            self.assertIn(setting, values)
+
+    def test_git_fails_closed_when_python_executable_is_not_absolute(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with mock.patch.object(read_only_executor.sys, "executable", "python3"):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "absolute Python"):
+                executor._git("rev-parse", "HEAD")
+
+    def test_git_fails_closed_when_python_executable_is_missing(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with mock.patch.object(read_only_executor.sys, "executable", "/missing/python"):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "absolute Python"):
+                executor._git("rev-parse", "HEAD")
+
+    def test_diff_disables_external_diff_and_textconv(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        real_run = subprocess.run
+        launched: list[list[str]] = []
+
+        def record(args, *pargs, **kwargs):
+            if isinstance(args, (list, tuple)) and executor.git_executable in args:
+                launched.append(list(args))
+            return real_run(args, *pargs, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=record):
+            executor._git("diff")
+        self.assertTrue(launched)
+        self.assertIn("--no-ext-diff", launched[-1])
+        self.assertIn("--no-textconv", launched[-1])
+
+    def test_git_rechecks_metadata_inode_after_run(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        config = self.fixture.target / ".git" / "config"
+        real_run = subprocess.run
+        swapped = False
+
+        def swap_after_git(*args, **kwargs):
+            nonlocal swapped
+            result = real_run(*args, **kwargs)
+            if not swapped and args and isinstance(args[0], list) and args[0][0] == sys.executable:
+                replacement = config.with_suffix(".new")
+                replacement.write_bytes(config.read_bytes())
+                replacement.replace(config)
+                swapped = True
+            return result
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=swap_after_git):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "changed during|Git metadata"):
+                executor._git("rev-parse", "HEAD")
+        self.assertTrue(swapped)
 
     def test_bind_rejects_objects_symlink_to_external_database(self) -> None:
         objects = self.fixture.target / ".git" / "objects"
