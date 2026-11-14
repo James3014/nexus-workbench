@@ -7,12 +7,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import stat
 import subprocess
-import tempfile
+import sys
+import time
 from typing import Any, Mapping
 
 from .model import ActionCell, ActionMode, ObservationBundle, ObservationOutcome
+from .safe_paths import open_directory, open_parent, open_path
 
 READ_ONLY_EXECUTOR_CLAIM_CEILING = "G2_READ_ONLY_EXECUTOR_CANARY_ONLY"
 _ALLOWED_REPO_OPS = frozenset(
@@ -25,6 +28,8 @@ _MAX_ARTIFACT_BYTES = 1_000_000
 # Every snapshot walks and hashes the whole target, twice per action. These
 # ceilings bound that cost; a larger target is refused, not partially hashed.
 _MAX_MANIFEST_ENTRIES = 50_000
+_GIT_EXECUTABLE_ENV = "NEXUS_WORKBENCH_GIT_EXECUTABLE"
+_GIT_CONFIG_PATH = Path("/etc/nexus-workbench/git.conf")
 _MAX_MANIFEST_BYTES = 512 * 1024 * 1024
 
 
@@ -39,6 +44,13 @@ class TargetSnapshot:
     git_status: str
     manifest_hash: str
     manifest_entries: Mapping[str, str]
+    git_executable: str = ""
+    git_source: str = ""
+    git_owner: str = ""
+    git_mode: str = ""
+    git_sha256: str = ""
+    git_version: str = ""
+    git_replace_ref_check_passed: bool = False
 
     @property
     def identity(self) -> str:
@@ -47,6 +59,13 @@ class TargetSnapshot:
             "tree": self.tree,
             "git_status": self.git_status,
             "manifest_hash": self.manifest_hash,
+            "git_executable": self.git_executable,
+            "git_source": self.git_source,
+            "git_owner": self.git_owner,
+            "git_mode": self.git_mode,
+            "git_sha256": self.git_sha256,
+            "git_version": self.git_version,
+            "git_replace_ref_check_passed": self.git_replace_ref_check_passed,
         }
         raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return "workbench-target:v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -59,6 +78,13 @@ class TargetSnapshot:
             "git_status": self.git_status,
             "manifest_hash": self.manifest_hash,
             "manifest_entry_count": len(self.manifest_entries),
+            "git_executable": self.git_executable,
+            "git_source": self.git_source,
+            "git_owner": self.git_owner,
+            "git_mode": self.git_mode,
+            "git_sha256": self.git_sha256,
+            "git_version": self.git_version,
+            "git_replace_ref_check_passed": self.git_replace_ref_check_passed,
         }
 
 
@@ -70,7 +96,119 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _manifest(root: Path) -> dict[str, str]:
+def _resolve_trusted_git() -> dict[str, str]:
+    """Select, validate, and describe the trusted Git executable."""
+    if sys.platform == "darwin":
+        defaults = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "/opt/local/bin/git")
+    elif sys.platform.startswith("linux"):
+        defaults = (
+            "/usr/bin/git", "/usr/local/bin/git", "/bin/git", "/opt/local/bin/git",
+            "/nix/var/nix/profiles/default/bin/git", "/run/current-system/sw/bin/git",
+        )
+    else:
+        defaults = ("/usr/bin/git",)
+
+    approved_owners = {0}
+    if sys.platform == "darwin":
+        try:
+            approved_owners.add(pwd.getpwnam("_installd").pw_uid)
+        except KeyError:
+            pass
+
+    def safe(path: Path, info: os.stat_result) -> bool:
+        if info.st_uid not in approved_owners:
+            return False
+        if info.st_mode & 0o022 or os.access(path, os.W_OK):
+            return False
+        for directory in path.parents:
+            parent = directory.stat()
+            if parent.st_uid not in approved_owners or parent.st_mode & 0o022 or os.access(directory, os.W_OK):
+                return False
+        return True
+
+    def describe(candidate: str, source: str) -> dict[str, str] | None:
+        path = Path(candidate)
+        if not path.is_absolute():
+            return None
+        try:
+            path = path.resolve(strict=True)
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111 or not safe(path, info):
+                return None
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                opened = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                if not stat.S_ISREG(opened.st_mode) or identity != (
+                    opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns
+                ):
+                    return None
+                with os.fdopen(fd, "rb", closefd=False) as handle:
+                    content = handle.read()
+                current = path.stat()
+                if identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns):
+                    return None
+            finally:
+                os.close(fd)
+            # The validated file and its parent chain cannot be changed by the
+            # caller between this digest and execution.
+            version = subprocess.run(
+                [str(path), "--version"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=False,
+                env={"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                     "GIT_NO_REPLACE_OBJECTS": "1"},
+            )
+            if version.returncode != 0 or not version.stdout.strip():
+                return None
+            return {
+                "git_executable": str(path), "git_source": source,
+                "git_owner": pwd.getpwuid(info.st_uid).pw_name,
+                "git_mode": f"{stat.S_IMODE(info.st_mode):04o}",
+                "git_sha256": hashlib.sha256(content).hexdigest(),
+                "git_version": version.stdout.strip(),
+            }
+        except (OSError, subprocess.SubprocessError, KeyError):
+            return None
+
+    if _GIT_EXECUTABLE_ENV in os.environ:
+        selected = describe(os.environ[_GIT_EXECUTABLE_ENV], "environment")
+        if selected is None:
+            raise ReadOnlyPolicyError(
+                f"trusted Git executable rejected; check {_GIT_EXECUTABLE_ENV}. "
+                "It must be root/installer-owned and caller-unwritable; PATH lookup is disabled."
+            )
+        return selected
+
+    try:
+        config_info = _GIT_CONFIG_PATH.stat()
+    except FileNotFoundError:
+        config_info = None
+    except OSError as exc:
+        raise ReadOnlyPolicyError(f"trusted Git config unavailable; check {_GIT_EXECUTABLE_ENV}") from exc
+    if config_info is not None:
+        try:
+            config_path = _GIT_CONFIG_PATH.resolve(strict=True)
+            if not stat.S_ISREG(config_info.st_mode) or not safe(config_path, config_info):
+                raise ReadOnlyPolicyError(f"untrusted Git config; check {_GIT_EXECUTABLE_ENV}")
+            candidate = config_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise ReadOnlyPolicyError(f"cannot read Git config; check {_GIT_EXECUTABLE_ENV}") from exc
+        selected = describe(candidate, "config")
+        if selected is None:
+            raise ReadOnlyPolicyError(f"Git config executable rejected; check {_GIT_EXECUTABLE_ENV}")
+        return selected
+
+    for candidate in defaults:
+        selected = describe(candidate, "default")
+        if selected is not None:
+            return selected
+    raise ReadOnlyPolicyError(
+        f"Trusted Git executable unavailable; configure {_GIT_EXECUTABLE_ENV} or install Git "
+        "in a supported system location. PATH lookup is disabled."
+    )
+
+
+def _manifest(root: Path, root_fd: int | None = None) -> dict[str, str]:
     result: dict[str, str] = {}
     hashed_bytes = 0
 
@@ -86,33 +224,50 @@ def _manifest(root: Path) -> dict[str, str]:
                 f"target exceeds G2 manifest limit of {_MAX_MANIFEST_BYTES} file bytes"
             )
 
-    def visit(directory: Path) -> None:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        for entry in entries:
-            path = Path(entry.path)
-            if directory == root and entry.name == ".git":
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY) if root_fd is None else os.dup(root_fd)
+
+    def visit(directory_fd: int, prefix: tuple[str, ...] = ()) -> None:
+        for name in sorted(os.listdir(directory_fd)):
+            if not prefix and name == ".git":
                 continue
-            rel = path.relative_to(root).as_posix()
-            info = entry.stat(follow_symlinks=False)
+            rel = "/".join((*prefix, name))
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             mode = stat.S_IMODE(info.st_mode)
-            admit(info.st_size if entry.is_file(follow_symlinks=False) else 0)
-            if entry.is_symlink():
-                result[rel] = f"L:{mode:o}:{os.readlink(path)}"
+            admit(info.st_size if stat.S_ISREG(info.st_mode) else 0)
+            if stat.S_ISLNK(info.st_mode):
+                result[rel] = f"L:{mode:o}:{os.readlink(name, dir_fd=directory_fd)}"
                 continue
-            if entry.is_dir(follow_symlinks=False):
+            if stat.S_ISDIR(info.st_mode):
                 result[rel] = f"D:{mode:o}"
-                visit(path)
+                child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise ReadOnlyPolicyError("target changed during G2 manifest scan")
+                    visit(child_fd, (*prefix, name))
+                finally:
+                    os.close(child_fd)
                 continue
-            if entry.is_file(follow_symlinks=False):
+            if stat.S_ISREG(info.st_mode):
                 digest = hashlib.sha256()
-                with path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise ReadOnlyPolicyError("target changed during G2 manifest scan")
+                    with os.fdopen(fd, "rb", closefd=False) as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                finally:
+                    os.close(fd)
                 result[rel] = f"F:{mode:o}:{info.st_size}:{digest.hexdigest()}"
                 continue
             result[rel] = f"S:{mode:o}:{stat.S_IFMT(info.st_mode):o}"
 
-    visit(root)
+    try:
+        visit(root_fd)
+    finally:
+        os.close(root_fd)
     return result
 
 
@@ -154,6 +309,7 @@ class LocalReadOnlyExecutor:
     @classmethod
     def bind(cls, target_root: str | os.PathLike[str], scratch_root: str | os.PathLike[str]) -> "LocalReadOnlyExecutor":
         target = Path(target_root).expanduser().resolve(strict=True)
+        target_info = os.stat(target, follow_symlinks=False)
         if not target.is_dir():
             raise ReadOnlyPolicyError("target_root must be a directory")
 
@@ -161,6 +317,7 @@ class LocalReadOnlyExecutor:
         if scratch == target or scratch.is_relative_to(target) or target.is_relative_to(scratch):
             raise ReadOnlyPolicyError("scratch_root must be physically disjoint from target_root")
         scratch.mkdir(parents=True, exist_ok=True)
+        scratch_info = os.stat(scratch, follow_symlinks=False)
         scratch = scratch.resolve(strict=True)
         if scratch == target or scratch.is_relative_to(target) or target.is_relative_to(scratch):
             raise ReadOnlyPolicyError("scratch_root must be physically disjoint from target_root")
@@ -168,12 +325,25 @@ class LocalReadOnlyExecutor:
         executor = cls.__new__(cls)
         executor.target_root = target
         executor.scratch_root = scratch
+        git_info = _resolve_trusted_git()
+        executor.git_executable = git_info["git_executable"]
+        executor.git_source = git_info["git_source"]
+        executor.git_owner = git_info["git_owner"]
+        executor.git_mode = git_info["git_mode"]
+        executor.git_sha256 = git_info["git_sha256"]
+        executor.git_version = git_info["git_version"]
+        executor._target_fd = open_directory(target, target_info)
+        executor._scratch_fd = open_directory(scratch, scratch_info)
         digest = hashlib.sha256(str(target).encode("utf-8")).hexdigest()[:16]
         executor._identity = f"local-readonly-v1:{digest}"
 
         top = executor._git("rev-parse", "--show-toplevel").strip()
         if Path(top).resolve(strict=True) != target:
             raise ReadOnlyPolicyError("target_root must be the exact Git worktree root")
+
+        if self_replace_refs := executor._git("for-each-ref", "--format=%(refname)", "refs/replace").strip():
+            raise ReadOnlyPolicyError(f"Git replace refs are forbidden: {self_replace_refs}")
+        executor.git_replace_ref_check_passed = True
 
         baseline = executor._snapshot()
         if baseline.git_status:
@@ -300,7 +470,18 @@ class LocalReadOnlyExecutor:
         path = self._target_path(payload.get("path"))
         if not path.is_file():
             raise ReadOnlyPolicyError("repo.read path must be a regular file")
-        data = path.read_bytes()
+        rel = path.relative_to(self.target_root).as_posix()
+        fd = open_path(self._target_fd, Path(rel).parts)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ReadOnlyPolicyError("repo.read path must be a regular file")
+            if info.st_size > _MAX_READ_BYTES:
+                raise ReadOnlyPolicyError("repo.read file exceeds G2 size limit")
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                data = handle.read(_MAX_READ_BYTES + 1)
+        finally:
+            os.close(fd)
         if len(data) > _MAX_READ_BYTES:
             raise ReadOnlyPolicyError("repo.read file exceeds G2 size limit")
         try:
@@ -346,20 +527,24 @@ class LocalReadOnlyExecutor:
 
         matches: list[dict[str, Any]] = []
         for path in files:
-            resolved = path.resolve(strict=True)
-            if resolved != self.target_root and not resolved.is_relative_to(self.target_root):
-                raise ReadOnlyPolicyError("repo.search encountered target path escape")
-            if not resolved.is_file() or resolved.stat().st_size > _MAX_READ_BYTES:
-                continue
+            rel = path.relative_to(self.target_root).as_posix()
             try:
-                lines = resolved.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
+                fd = open_path(self._target_fd, Path(rel).parts)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_READ_BYTES:
+                        continue
+                    with os.fdopen(fd, "rb", closefd=False) as handle:
+                        lines = handle.read(_MAX_READ_BYTES + 1).decode("utf-8").splitlines()
+                finally:
+                    os.close(fd)
+            except (UnicodeDecodeError, OSError, ValueError):
                 continue
             for line_no, line in enumerate(lines, start=1):
                 if query in line:
                     matches.append(
                         {
-                            "path": resolved.relative_to(self.target_root).as_posix(),
+                            "path": rel,
                             "line": line_no,
                             "text": line,
                         }
@@ -401,14 +586,19 @@ class LocalReadOnlyExecutor:
         tests: list[str] = []
         parse_errors: list[dict[str, str]] = []
         for path in candidates:
-            resolved = path.resolve(strict=True)
-            if resolved != self.target_root and not resolved.is_relative_to(self.target_root):
-                raise ReadOnlyPolicyError("test.discover encountered target path escape")
-            data = resolved.read_bytes()
+            rel = path.relative_to(self.target_root).as_posix()
+            fd = open_path(self._target_fd, Path(rel).parts)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ReadOnlyPolicyError("test.discover candidate is not a regular file")
+                with os.fdopen(fd, "rb", closefd=False) as handle:
+                    data = handle.read(_MAX_READ_BYTES + 1)
+            finally:
+                os.close(fd)
             if len(data) > _MAX_READ_BYTES:
-                parse_errors.append({"path": resolved.relative_to(self.target_root).as_posix(), "error": "size limit"})
+                parse_errors.append({"path": rel, "error": "size limit"})
                 continue
-            rel = resolved.relative_to(self.target_root).as_posix()
             files.append(rel)
             try:
                 tree = ast.parse(data.decode("utf-8"), filename=rel)
@@ -440,22 +630,27 @@ class LocalReadOnlyExecutor:
         if len(data) > _MAX_ARTIFACT_BYTES:
             raise ReadOnlyPolicyError("artifact.write exceeds G2 size limit")
         path = self._scratch_path(path_value)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".artifact-", suffix=".tmp", dir=path.parent)
+        rel = path.relative_to(self.scratch_root)
+        parent_fd, final_name = open_parent(self._scratch_fd, rel.parts, create=True)
+        temp_name = f".artifact-{os.getpid()}-{time.monotonic_ns()}.tmp"
+        fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
+            os.rename(temp_name, final_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
         except Exception:
             try:
-                os.unlink(temp_name)
+                os.unlink(temp_name, dir_fd=parent_fd)
             except FileNotFoundError:
                 pass
             raise
-        rel = path.relative_to(self.scratch_root).as_posix()
-        return {"path": rel, "bytes": len(data), "sha256": _sha256_bytes(data)}, f"scratch:{rel}"
+        finally:
+            os.close(parent_fd)
+        rel_text = rel.as_posix()
+        return {"path": rel_text, "bytes": len(data), "sha256": _sha256_bytes(data)}, f"scratch:{rel_text}"
 
     def _target_path(self, value: Any) -> Path:
         raw = "." if value in (None, "") else value
@@ -499,27 +694,42 @@ class LocalReadOnlyExecutor:
             "--untracked-files=all",
             "--ignored=matching",
         )
-        entries = _manifest(self.target_root)
+        entries = _manifest(self.target_root, self._target_fd)
         return TargetSnapshot(
             head=head,
             tree=tree,
             git_status=status_text,
             manifest_hash=_manifest_hash(entries),
             manifest_entries=entries,
+            git_executable=self.git_executable,
+            git_source=self.git_source,
+            git_owner=self.git_owner,
+            git_mode=self.git_mode,
+            git_sha256=self.git_sha256,
+            git_version=self.git_version,
+            git_replace_ref_check_passed=self.git_replace_ref_check_passed,
         )
 
     def _git(self, *args: str) -> str:
-        env = os.environ.copy()
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update(
             {
+                "PATH": os.environ.get("PATH", os.defpath),
+                "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
                 "PAGER": "cat",
             }
         )
+        if not hasattr(os, "fchdir") or not sys.executable:
+            raise ReadOnlyPolicyError("pinned-directory Git execution is unavailable on this platform")
+        launcher = "import os,sys; os.fchdir(int(sys.argv[1])); os.execve(sys.argv[2], sys.argv[2:], os.environ)"
         proc = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", *args],
-            cwd=self.target_root,
+            [
+                sys.executable, "-I", "-S", "-c", launcher,
+                str(self._target_fd), self.git_executable, "-c", "core.fsmonitor=false", *args,
+            ],
+            pass_fds=(self._target_fd,),
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

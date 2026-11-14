@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -11,6 +13,8 @@ from unittest import mock
 from nexus_workbench import ActionCell, ActionMode, ObservationOutcome
 from nexus_workbench import read_only_executor
 from nexus_workbench.read_only_executor import LocalReadOnlyExecutor, ReadOnlyPolicyError
+
+TRUSTED_GIT = "/usr/bin/git"
 
 
 def git(root: Path, *args: str) -> str:
@@ -82,6 +86,15 @@ def action(
 
 class ReadOnlyExecutorCanaryTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.git_env = mock.patch.dict("os.environ", {
+            "NEXUS_WORKBENCH_GIT_EXECUTABLE": TRUSTED_GIT,
+            "GIT_NO_REPLACE_OBJECTS": "",
+        })
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
+        self.config_path = mock.patch.object(read_only_executor, "_GIT_CONFIG_PATH", Path("/missing-workbench-git.conf"), create=True)
+        self.config_path.start()
+        self.addCleanup(self.config_path.stop)
         self.fixture = RepoFixture()
         self.executor = LocalReadOnlyExecutor.bind(
             self.fixture.target,
@@ -311,8 +324,88 @@ class ReadOnlyExecutorCanaryTests(unittest.TestCase):
         self.assertEqual(via_link.target_identity, self.executor.target_identity)
 
 
+    def test_git_default_discovery_works_without_an_override(self) -> None:
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        self.assertEqual(executor.git_source, "default")
+        self.assertTrue(Path(executor.git_executable).is_absolute())
+
+    def test_git_default_discovery_ignores_path_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as fake_bin:
+            fake = Path(fake_bin) / "git"
+            marker = Path(fake_bin) / "was-run"
+            fake.write_text(f"#!/bin/sh\nprintf called > '{marker}'\nexit 0\n", encoding="utf-8")
+            fake.chmod(0o755)
+            with mock.patch.dict("os.environ", {"PATH": fake_bin}):
+                os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+                executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            self.assertTrue(Path(executor.git_executable).is_absolute())
+            self.assertFalse(marker.exists())
+
+    def test_admin_config_precedes_defaults_when_environment_is_unset(self) -> None:
+        config = Path("/etc/hosts")
+        original_read_text = Path.read_text
+
+        def read_config(path, *args, **kwargs):
+            if path.name == "hosts":
+                return TRUSTED_GIT
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(read_only_executor, "_GIT_CONFIG_PATH", config), \
+             mock.patch.object(Path, "read_text", read_config), \
+             mock.patch.dict("os.environ"):
+            os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        self.assertEqual(executor.git_source, "config")
+        self.assertEqual(executor.git_executable, str(Path(TRUSTED_GIT).resolve()))
+
+    def test_caller_writable_override_is_rejected_before_version_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / "git"
+            marker = Path(tmp) / "was-run"
+            wrapper.write_text(
+                f"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version fake'; exit 0; fi\n"
+                f"printf called > '{marker}'\nexec {TRUSTED_GIT} \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            with mock.patch.dict("os.environ", {"NEXUS_WORKBENCH_GIT_EXECUTABLE": str(wrapper)}):
+                with self.assertRaisesRegex(ReadOnlyPolicyError, "NEXUS_WORKBENCH_GIT_EXECUTABLE"):
+                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            self.assertFalse(marker.exists())
+
+    def test_git_evidence_matches_the_executable_passed_to_launcher(self) -> None:
+        executor = self.executor
+        launched: list[list[str]] = []
+        replace_guard_values: list[str | None] = []
+        real_run = subprocess.run
+
+        def record_run(args, *pargs, **kwargs):
+            if isinstance(args, (list, tuple)) and executor.git_executable in args:
+                launched.append(list(args))
+                replace_guard_values.append(kwargs.get("env", {}).get("GIT_NO_REPLACE_OBJECTS"))
+            return real_run(args, *pargs, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=record_run):
+            executor._git("rev-parse", "HEAD")
+        evidence = executor.snapshot().summary()
+        self.assertTrue(launched)
+        self.assertTrue(replace_guard_values)
+        self.assertTrue(all(value == "1" for value in replace_guard_values))
+        self.assertIn(executor.git_executable, launched[-1])
+        self.assertEqual(evidence["git_sha256"], read_only_executor._sha256_bytes(Path(executor.git_executable).read_bytes()))
+        self.assertEqual(evidence["git_source"], "environment")
+        self.assertTrue(evidence["git_owner"])
+        self.assertTrue(evidence["git_mode"])
+        self.assertTrue(evidence["git_version"])
+        self.assertTrue(evidence["git_replace_ref_check_passed"])
+
 class ManifestLimitTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.git_env = mock.patch.dict("os.environ", {"GIT_NO_REPLACE_OBJECTS": ""})
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
         self.fixture = RepoFixture()
 
     def tearDown(self) -> None:
@@ -344,6 +437,235 @@ class ManifestLimitTests(unittest.TestCase):
         with mock.patch.object(read_only_executor, "_MAX_MANIFEST_ENTRIES", 3):
             with self.assertRaisesRegex(ReadOnlyPolicyError, "manifest limit"):
                 executor.execute(action("S1", "repo.read", path="README.md"))
+
+    def test_bind_rejects_replace_refs(self) -> None:
+        git(self.fixture.target, "replace", "HEAD", "HEAD")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "replace refs"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_executable_ignores_path_wrapper_for_trusted_absolute_path(self) -> None:
+        real_git = TRUSTED_GIT
+        with tempfile.TemporaryDirectory() as fake_bin:
+            fake = Path(fake_bin) / "git"
+            marker = Path(fake_bin) / "was-run"
+            fake.write_text(
+                f"#!/bin/sh\nprintf called > '{marker}'\nexec {real_git} \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            with mock.patch.dict("os.environ", {
+                "PATH": fake_bin,
+                "NEXUS_WORKBENCH_GIT_EXECUTABLE": real_git,
+            }):
+                executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+                top = executor._git("rev-parse", "--show-toplevel").strip()
+            self.assertEqual(Path(top), self.fixture.target.resolve())
+            self.assertFalse(marker.exists(), "Git was substituted by the caller's PATH wrapper")
+            self.assertEqual(Path(executor.git_executable), Path(real_git).resolve())
+            self.assertTrue(executor.git_version)
+
+    def test_git_executable_fails_closed_without_trusted_absolute_path(self) -> None:
+        with mock.patch.dict("os.environ", {"NEXUS_WORKBENCH_GIT_EXECUTABLE": ""}):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "NEXUS_WORKBENCH_GIT_EXECUTABLE"):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_environment_overrides_cannot_redirect_snapshot(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        foreign = self.fixture.root / "foreign.git"
+        subprocess.run(["git", "init", "--bare", str(foreign)], check=True, capture_output=True)
+        subprocess.run(["git", "--git-dir", str(foreign), "--work-tree", str(self.fixture.target), "add", "-A"], check=True, capture_output=True)
+        with mock.patch.dict("os.environ", {
+            "GIT_DIR": str(foreign),
+            "GIT_WORK_TREE": str(self.fixture.root),
+            "GIT_INDEX_FILE": str(foreign / "index"),
+            "GIT_NAMESPACE": "forged",
+        }):
+            self.assertEqual(Path(executor._git("rev-parse", "--show-toplevel").strip()), self.fixture.target.resolve())
+            self.assertEqual(executor._git("rev-parse", "HEAD").strip(), executor.baseline.head)
+
+
+class DescriptorRaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RepoFixture()
+        self.executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def test_repo_read_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "README.md"
+        original = self.executor._target_path
+        swapped = False
+
+        def swap_after_check(value):
+            nonlocal swapped
+            resolved = original(value)
+            if value == "README.md" and not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+            return resolved
+
+        with mock.patch.object(self.executor, "_target_path", swap_after_check):
+            try:
+                observed = self.executor._repo_read({"op": "repo.read", "path": "README.md"})
+            except (OSError, ReadOnlyPolicyError):
+                observed = {"text": ""}
+        self.assertTrue(swapped)
+        self.assertNotEqual(observed["text"], "outside secret\n")
+
+    def test_snapshot_git_uses_pinned_target_after_path_replacement(self) -> None:
+        pinned_head = self.executor.baseline.head
+        target = self.fixture.target
+        displaced = self.fixture.root / "displaced-target"
+        replacement = self.fixture.root / "replacement"
+        replacement.mkdir()
+        git(replacement, "init")
+        git(replacement, "config", "user.email", "replacement@example.invalid")
+        git(replacement, "config", "user.name", "Replacement")
+        (replacement / "README.md").write_text("replacement tree\n", encoding="utf-8")
+        git(replacement, "add", ".")
+        git(replacement, "commit", "-m", "replacement")
+        swapped = False
+        original_git = self.executor._git
+
+        def swap_before_git(*args):
+            nonlocal swapped
+            if not swapped:
+                target.rename(displaced)
+                replacement.rename(target)
+                swapped = True
+            return original_git(*args)
+
+        with mock.patch.object(self.executor, "_git", side_effect=swap_before_git):
+            snapshot = self.executor.snapshot()
+        self.assertTrue(swapped, "the target path replacement must occur during the snapshot")
+        self.assertEqual(snapshot.head, pinned_head)
+
+    def test_repo_search_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "README.md"
+        original_is_file = Path.is_file
+        original_open_path = getattr(read_only_executor, "open_path", None)
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def is_file_then_swap(candidate, *args, **kwargs):
+            result = original_is_file(candidate, *args, **kwargs)
+            if candidate.name == path.name:
+                replace_candidate()
+            return result
+
+        def open_then_swap(*args, **kwargs):
+            if args[1][-1] == path.name:
+                replace_candidate()
+            return original_open_path(*args, **kwargs)
+
+        with mock.patch.object(Path, "is_file", is_file_then_swap), mock.patch.object(
+            read_only_executor, "open_path", open_then_swap, create=True
+        ):
+            try:
+                observed = self.executor._repo_search({"op": "repo.search", "path": ".", "query": "outside secret", "max_results": 10})
+            except (OSError, ReadOnlyPolicyError, ValueError):
+                observed = {"matches": []}
+        self.assertTrue(swapped)
+        self.assertEqual(observed["matches"], [])
+
+    def test_test_discover_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "tests" / "test_safe.py"
+        original_resolve = Path.resolve
+        original_open_path = getattr(read_only_executor, "open_path", None)
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                self.fixture.outside.write_text("def test_outside_secret_marker():\n    pass\n", encoding="utf-8")
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def resolve_then_replace(candidate, *args, **kwargs):
+            result = original_resolve(candidate, *args, **kwargs)
+            if candidate.name == path.name:
+                replace_candidate()
+            return result
+
+        def open_then_replace(*args, **kwargs):
+            if args[1][-1] == path.name:
+                replace_candidate()
+            return original_open_path(*args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", resolve_then_replace), mock.patch.object(
+            read_only_executor, "open_path", open_then_replace, create=True
+        ):
+            try:
+                observed = self.executor._test_discover({"op": "test.discover", "path": "tests"})
+            except (OSError, ReadOnlyPolicyError):
+                observed = {"tests": [], "files": []}
+        self.assertTrue(swapped)
+        self.assertNotIn("test_outside_secret_marker", str(observed))
+
+    def test_manifest_fingerprints_opened_regular_file(self) -> None:
+        path = self.fixture.target / "README.md"
+        original_open = os.open
+        original_path_open = Path.open
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def swap_then_open(candidate, flags, *args, **kwargs):
+            if candidate == path.name and kwargs.get("dir_fd") is not None:
+                replace_candidate()
+            return original_open(candidate, flags, *args, **kwargs)
+
+        def swap_then_path_open(candidate, *args, **kwargs):
+            if candidate.name == path.name:
+                replace_candidate()
+            return original_path_open(candidate, *args, **kwargs)
+
+        with mock.patch.object(os, "open", swap_then_open), mock.patch.object(Path, "open", swap_then_path_open):
+            try:
+                entries = read_only_executor._manifest(self.fixture.target)
+            except OSError:
+                entries = {}
+        self.assertTrue(swapped)
+        outside_hash = read_only_executor._sha256_bytes(self.fixture.outside.read_bytes())
+        self.assertNotIn(outside_hash, str(entries.get("README.md", "")))
+
+    def test_artifact_parent_swap_cannot_redirect_write(self) -> None:
+        outside = self.fixture.root / "escaped"
+        original = self.executor._scratch_path
+        swapped = False
+
+        def swap_after_validation(value):
+            nonlocal swapped
+            result = original(value)
+            parent = self.fixture.scratch / "notes"
+            if not swapped:
+                parent.mkdir(exist_ok=True)
+                parent.rmdir()
+                parent.symlink_to(self.fixture.root, target_is_directory=True)
+                swapped = True
+            return result
+
+        with mock.patch.object(self.executor, "_scratch_path", swap_after_validation):
+            try:
+                self.executor._artifact_write({"op": "artifact.write", "path": "notes/escaped", "content": "secret"})
+            except (OSError, ReadOnlyPolicyError):
+                pass
+        self.assertTrue(swapped)
+        self.assertFalse(outside.exists())
 
 
 if __name__ == "__main__":
