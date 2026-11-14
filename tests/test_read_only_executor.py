@@ -14,7 +14,10 @@ from nexus_workbench import ActionCell, ActionMode, ObservationOutcome
 from nexus_workbench import read_only_executor
 from nexus_workbench.read_only_executor import LocalReadOnlyExecutor, ReadOnlyPolicyError
 
-TRUSTED_GIT = "/usr/bin/git"
+TRUSTED_GIT = next(
+    (c for c in ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git") if os.path.exists(c)),
+    "/usr/bin/git",
+)
 
 
 def git(root: Path, *args: str) -> str:
@@ -441,6 +444,51 @@ class ManifestLimitTests(unittest.TestCase):
     def test_bind_rejects_replace_refs(self) -> None:
         git(self.fixture.target, "replace", "HEAD", "HEAD")
         with self.assertRaisesRegex(ReadOnlyPolicyError, "replace refs"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_subprocess_env_is_allowlisted(self) -> None:
+        recorded: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            recorded.append(dict(kwargs.get("env") or {}))
+            return real_run(*args, **kwargs)
+
+        poisoned = {
+            "LD_PRELOAD": "/nonexistent.so",
+            "DYLD_INSERT_LIBRARIES": "/nonexistent.dylib",
+            "SECRET_TOKEN": "x",
+            "GIT_CONFIG_COUNT": "1",
+        }
+        with mock.patch.dict("os.environ", poisoned):
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+                executor._git("rev-parse", "--show-toplevel")
+        self.assertTrue(recorded)
+        for env in recorded:
+            for key in poisoned:
+                self.assertNotIn(key, env)
+
+    def test_bind_rejects_grafts(self) -> None:
+        info = self.fixture.target / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        head = git(self.fixture.target, "rev-parse", "HEAD").strip()
+        (info / "grafts").write_text(f"{head}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "graft"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_alternates(self) -> None:
+        info = self.fixture.target / ".git" / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "alternates").write_text(str(self.fixture.outside.parent) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "alternate"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_git_dir_outside_target(self) -> None:
+        external = self.fixture.root / "external-gitdir"
+        shutil.move(str(self.fixture.target / ".git"), str(external))
+        (self.fixture.target / ".git").write_text(f"gitdir: {external}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "outside"):
             LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
     def test_git_executable_ignores_path_wrapper_for_trusted_absolute_path(self) -> None:

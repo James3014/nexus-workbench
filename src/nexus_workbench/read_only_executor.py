@@ -345,6 +345,17 @@ class LocalReadOnlyExecutor:
             raise ReadOnlyPolicyError(f"Git replace refs are forbidden: {self_replace_refs}")
         executor.git_replace_ref_check_passed = True
 
+        git_dir = Path(executor._git("rev-parse", "--absolute-git-dir").strip()).resolve(strict=True)
+        common_raw = executor._git("rev-parse", "--git-common-dir").strip()
+        common_dir = (Path(common_raw) if Path(common_raw).is_absolute() else target / common_raw).resolve(strict=True)
+        for label, candidate in (("git directory", git_dir), ("common directory", common_dir)):
+            if candidate != target / ".git" and (target / ".git") not in candidate.parents:
+                raise ReadOnlyPolicyError(f"Git {label} is outside the target worktree: {candidate}")
+        if (common_dir / "info" / "grafts").exists() or (git_dir / "info" / "grafts").exists():
+            raise ReadOnlyPolicyError("Git grafts are forbidden")
+        if (common_dir / "objects" / "info" / "alternates").exists():
+            raise ReadOnlyPolicyError("Git alternate object databases are forbidden")
+
         baseline = executor._snapshot()
         if baseline.git_status:
             raise ReadOnlyPolicyError("G2 target must be clean with no untracked or ignored worktree state")
@@ -711,10 +722,12 @@ class LocalReadOnlyExecutor:
         )
 
     def _git(self, *args: str) -> str:
-        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR") if key in os.environ}
         env.update(
             {
-                "PATH": os.environ.get("PATH", os.defpath),
+                "PATH": os.defpath,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
