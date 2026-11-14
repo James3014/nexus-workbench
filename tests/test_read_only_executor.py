@@ -484,6 +484,22 @@ class ManifestLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(ReadOnlyPolicyError, "alternate"):
             LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
+    def test_bind_rejects_objects_symlink_to_external_database(self) -> None:
+        objects = self.fixture.target / ".git" / "objects"
+        external = self.fixture.root / "external-objects"
+        objects.rename(external)
+        objects.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink|outside"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_refs_symlink_to_external_directory(self) -> None:
+        refs = self.fixture.target / ".git" / "refs"
+        external = self.fixture.root / "external-refs"
+        refs.rename(external)
+        refs.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink|outside"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
     def test_bind_rejects_git_dir_outside_target(self) -> None:
         external = self.fixture.root / "external-gitdir"
         shutil.move(str(self.fixture.target / ".git"), str(external))

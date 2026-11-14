@@ -353,6 +353,21 @@ class LocalReadOnlyExecutor:
                 raise ReadOnlyPolicyError(f"Git {label} is outside the target worktree: {candidate}")
         if (common_dir / "info" / "grafts").exists() or (git_dir / "info" / "grafts").exists():
             raise ReadOnlyPolicyError("Git grafts are forbidden")
+        for candidate in {git_dir, common_dir}:
+            for name in ("objects", "refs"):
+                root = candidate / name
+                if not root.exists() and not root.is_symlink():
+                    continue
+                if root.is_symlink():
+                    raise ReadOnlyPolicyError(f"Git {name} path is a symlink: {root}")
+                for current, directories, files in os.walk(root, followlinks=False):
+                    paths = [Path(current), *(Path(current) / entry for entry in directories + files)]
+                    for path in paths:
+                        if path.is_symlink():
+                            raise ReadOnlyPolicyError(f"Git {name} path is a symlink: {path}")
+                        resolved = path.resolve(strict=False)
+                        if resolved != target and target not in resolved.parents:
+                            raise ReadOnlyPolicyError(f"Git {name} path is outside the target worktree: {path}")
         if (common_dir / "objects" / "info" / "alternates").exists():
             raise ReadOnlyPolicyError("Git alternate object databases are forbidden")
 
@@ -737,10 +752,20 @@ class LocalReadOnlyExecutor:
         if not hasattr(os, "fchdir") or not sys.executable:
             raise ReadOnlyPolicyError("pinned-directory Git execution is unavailable on this platform")
         launcher = "import os,sys; os.fchdir(int(sys.argv[1])); os.execve(sys.argv[2], sys.argv[2:], os.environ)"
+        git_args = [
+            self.git_executable,
+            "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "diff.external=",
+            "-c", "diff.textconv=",
+            *args,
+        ]
+        if args and args[0] == "diff":
+            git_args[git_args.index("diff") + 1 : git_args.index("diff") + 1] = ["--no-ext-diff", "--no-textconv"]
         proc = subprocess.run(
             [
                 sys.executable, "-I", "-S", "-c", launcher,
-                str(self._target_fd), self.git_executable, "-c", "core.fsmonitor=false", *args,
+                str(self._target_fd), *git_args,
             ],
             pass_fds=(self._target_fd,),
             env=env,
