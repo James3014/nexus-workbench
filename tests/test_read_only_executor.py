@@ -509,23 +509,25 @@ class ManifestLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
             LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
-    def test_bind_rejects_execution_capable_global_config(self) -> None:
+    def test_bind_ignores_global_filter_config_but_rejects_local_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             global_config = Path(tmp) / "gitconfig"
-            subprocess.run(["git", "config", "--file", str(global_config), "filter.hostile.smudge", "hostile"],
+            subprocess.run(["git", "config", "--file", str(global_config), "filter.lfs.clean", "git-lfs clean %f"],
                            check=True, capture_output=True)
             with mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": str(global_config)}):
-                with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
-                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
-    def test_bind_rejects_execution_capable_system_config(self) -> None:
+        git(self.fixture.target, "config", "filter.local.clean", "hostile")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_ignores_execution_capable_system_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             system_config = Path(tmp) / "gitconfig"
             subprocess.run(["git", "config", "--file", str(system_config), "core.fsmonitor", "hostile"],
                            check=True, capture_output=True)
             with mock.patch.dict("os.environ", {"GIT_CONFIG_SYSTEM": str(system_config)}):
-                with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
-                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
     def test_bind_rejects_each_execution_capable_config_family(self) -> None:
         keys = (

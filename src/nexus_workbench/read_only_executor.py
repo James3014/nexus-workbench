@@ -445,24 +445,14 @@ class LocalReadOnlyExecutor:
             executor._git_dirs[0], executor._git_dirs[0], executor._git_dirs[1]
         ):
             raise ReadOnlyPolicyError("Git metadata directories changed during bind")
-        config_lines = executor._git("config", "--no-includes", "--show-origin", "--list").splitlines()
-        global_config = os.environ.get("GIT_CONFIG_GLOBAL", str(Path.home() / ".gitconfig"))
-        config_lines.extend(executor._git(
-            "config", "--no-includes", "--show-origin", "--list",
-            env_overrides={"GIT_CONFIG_NOSYSTEM": "0", "GIT_CONFIG_GLOBAL": os.devnull,
-                           "GIT_CONFIG_COUNT": "0",
-                           **({"GIT_CONFIG_SYSTEM": os.environ["GIT_CONFIG_SYSTEM"]}
-                              if "GIT_CONFIG_SYSTEM" in os.environ else {})},
-        ).splitlines())
-        config_lines.extend(executor._git(
-            "config", "--global", "--no-includes", "--show-origin", "--list",
-            env_overrides={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": global_config,
-                           "GIT_CONFIG_COUNT": "0"},
-        ).splitlines())
+        config_lines = executor._git(
+            "config", "--no-includes", "--show-scope", "--list"
+        ).splitlines()
         for line in config_lines:
-            if line.startswith("command line:\t"):
+            scope, entry = line.split("\t", 1)
+            if scope not in {"local", "worktree"}:
                 continue
-            key = line.rsplit("\t", 1)[-1].split("=", 1)[0].lower()
+            key = entry.split("=", 1)[0].lower()
             if (key.startswith("filter.") or key.startswith("diff.") and key.endswith((".command", ".textconv"))
                     or key in {"core.fsmonitor", "core.hookspath", "include.path"}
                     or key.startswith("includeif.")):
