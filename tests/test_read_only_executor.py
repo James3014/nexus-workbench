@@ -509,6 +509,60 @@ class ManifestLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
             LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
 
+    def test_bind_rejects_execution_capable_config_in_nested_repository(self) -> None:
+        nested = self.fixture.target / "nested"
+        nested.mkdir()
+        git(nested, "init")
+        (nested / "README.md").write_text("nested\n", encoding="utf-8")
+        git(nested, "config", "filter.hostile.clean", "hostile")
+        git(nested, "add", "-A")
+        git(nested, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "nested")
+        git(self.fixture.target, "add", "nested")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "add nested")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_config_in_submodule_gitdir(self) -> None:
+        source = self.fixture.root / "submodule-source"
+        source.mkdir()
+        git(source, "init")
+        (source / "README.md").write_text("submodule\n", encoding="utf-8")
+        git(source, "add", "README.md")
+        git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial")
+        git(self.fixture.target, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "submodule")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-am", "add submodule")
+        config = self.fixture.target / ".git" / "modules" / "submodule" / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write('[filter "hostile"]\n\tclean = hostile\n')
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_rechecks_execution_capable_config_added_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with (self.fixture.target / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write('[core]\n\tfsmonitor = hostile\n')
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
+    def test_git_rechecks_execution_capable_config_replaced_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        config = self.fixture.target / ".git" / "config"
+        replacement = config.with_name("config.new")
+        replacement.write_text(config.read_text(encoding="utf-8") + '[filter "hostile"]\n\tclean = hostile\n', encoding="utf-8")
+        replacement.replace(config)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
+    def test_git_rechecks_new_worktree_config_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with (self.fixture.target / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write('[extensions]\n\tworktreeConfig = true\n')
+        (self.fixture.target / ".git" / "config.worktree").write_text(
+            '[core]\n\tfsmonitor = hostile\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
     def test_bind_ignores_global_filter_config_but_rejects_local_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             global_config = Path(tmp) / "gitconfig"
@@ -593,7 +647,7 @@ class ManifestLimitTests(unittest.TestCase):
         launched: list[list[str]] = []
 
         def record(args, *pargs, **kwargs):
-            if isinstance(args, (list, tuple)) and executor.git_executable in args:
+            if isinstance(args, (list, tuple)) and executor.git_executable in args and "diff" in args:
                 launched.append(list(args))
             return real_run(args, *pargs, **kwargs)
 

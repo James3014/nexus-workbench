@@ -103,6 +103,61 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _git_metadata_roots(target: Path, primary_git_dir: Path, primary_common_dir: Path) -> tuple[Path, ...]:
+    """Find the root repository and every nested Git directory/gitfile in target."""
+    roots: list[Path] = [primary_git_dir, primary_common_dir]
+    for current, directories, files in os.walk(target, followlinks=False):
+        current_path = Path(current)
+        if ".git" in directories:
+            entry = current_path / ".git"
+            info = os.lstat(entry)
+            if stat.S_ISLNK(info.st_mode):
+                raise ReadOnlyPolicyError(f"Git metadata symlink is forbidden: {entry}")
+            roots.append(entry)
+            directories.remove(".git")
+        elif ".git" in files:
+            entry = current_path / ".git"
+            info = os.lstat(entry)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ReadOnlyPolicyError(f"Git metadata entry is invalid: {entry}")
+            try:
+                pointer = entry.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ReadOnlyPolicyError("Git worktree pointer is invalid") from exc
+            if not pointer.startswith("gitdir: "):
+                raise ReadOnlyPolicyError("Git worktree pointer is invalid")
+            raw = Path(pointer[8:])
+            root = raw if raw.is_absolute() else entry.parent / raw
+            try:
+                roots.append(root.resolve(strict=True))
+            except OSError as exc:
+                raise ReadOnlyPolicyError("Git worktree pointer is unavailable") from exc
+
+    checked: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError as exc:
+            raise ReadOnlyPolicyError("Git metadata directory is unavailable") from exc
+        if resolved != target and not resolved.is_relative_to(target):
+            raise ReadOnlyPolicyError("Git metadata directory is outside the target repository")
+        if not resolved.is_dir():
+            raise ReadOnlyPolicyError("Git metadata directory is invalid")
+        checked.append(resolved)
+        common_file = resolved / "commondir"
+        if common_file.exists():
+            try:
+                raw_common = Path(common_file.read_text(encoding="utf-8").strip())
+                common = raw_common if raw_common.is_absolute() else resolved / raw_common
+                common = common.resolve(strict=True)
+            except (OSError, UnicodeError) as exc:
+                raise ReadOnlyPolicyError("Git common directory is unavailable") from exc
+            if common != target and not common.is_relative_to(target):
+                raise ReadOnlyPolicyError("Git common directory is outside the target repository")
+            checked.append(common)
+    return tuple(dict.fromkeys(checked))
+
+
 def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> tuple[tuple[str, int, int, int], ...]:
     """Fail closed on redirected or linkable Git metadata and return its inode view."""
     for label, directory in (("git directory", git_dir), ("common directory", common_dir)):
@@ -114,7 +169,8 @@ def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> 
             raise ReadOnlyPolicyError(f"Git {label} is outside the target repository")
 
     found: dict[str, os.stat_result] = {}
-    for root in dict.fromkeys((git_dir, common_dir)):
+    roots = _git_metadata_roots(target, git_dir, common_dir)
+    for root in roots:
         try:
             root_info = os.lstat(root)
         except OSError as exc:
@@ -150,6 +206,17 @@ def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> 
         if (directory / "refs" / "replace").exists():
             raise ReadOnlyPolicyError("Git replace refs are forbidden")
     return tuple(sorted((path, info.st_dev, info.st_ino, info.st_mode) for path, info in found.items()))
+
+
+def _execution_capable_git_key(key: str, value: str = "") -> bool:
+    key = key.lower()
+    return (
+        key.startswith("filter.")
+        or key.startswith("diff.") and key.endswith((".command", ".textconv"))
+        or key in {"core.fsmonitor", "core.hookspath", "include.path"}
+        or key.startswith("includeif.")
+        or key == "extensions.worktreeconfig" and value.strip().lower() in {"true", "yes", "on", "1"}
+    )
 
 
 def _resolve_trusted_git() -> dict[str, str]:
@@ -445,21 +512,6 @@ class LocalReadOnlyExecutor:
             executor._git_dirs[0], executor._git_dirs[0], executor._git_dirs[1]
         ):
             raise ReadOnlyPolicyError("Git metadata directories changed during bind")
-        config_lines = executor._git(
-            "config", "--no-includes", "--show-scope", "--list"
-        ).splitlines()
-        for line in config_lines:
-            scope, entry = line.split("\t", 1)
-            if scope not in {"local", "worktree"}:
-                continue
-            key = entry.split("=", 1)[0].lower()
-            if (key.startswith("filter.") or key.startswith("diff.") and key.endswith((".command", ".textconv"))
-                    or key in {"core.fsmonitor", "core.hookspath", "include.path"}
-                    or key.startswith("includeif.")):
-                raise ReadOnlyPolicyError(f"untrusted Git config: {key}")
-            if key == "extensions.worktreeconfig" and line.lower().endswith("=true"):
-                raise ReadOnlyPolicyError("untrusted Git config: extensions.worktreeConfig=true")
-
         baseline = executor._snapshot()
         if baseline.git_status:
             raise ReadOnlyPolicyError("G2 target must be clean with no untracked or ignored worktree state")
@@ -825,12 +877,55 @@ class LocalReadOnlyExecutor:
             git_replace_ref_check_passed=self.git_replace_ref_check_passed,
         )
 
+    def _check_execution_capable_git_config(self) -> None:
+        """Parse every local/worktree config without following include directives."""
+        env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR") if key in os.environ}
+        env.update({
+            "PATH": os.defpath,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_COUNT": str(len(_ENFORCED_GIT_CONFIG)),
+        })
+        for index, (key, value) in enumerate(_ENFORCED_GIT_CONFIG):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+        roots = _git_metadata_roots(self.target_root, *self._git_dirs)
+        config_files: set[Path] = set()
+        for root in roots:
+            for current, _, files in os.walk(root, followlinks=False):
+                for name in files:
+                    if name in {"config", "config.worktree"}:
+                        config_files.add(Path(current) / name)
+        for config in sorted(config_files):
+            try:
+                proc = subprocess.run(
+                    [self.git_executable, "config", "--no-includes", "--file", str(config), "--list"],
+                    cwd=self.target_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    env=env,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ReadOnlyPolicyError("cannot inspect Git config") from exc
+            if proc.returncode:
+                raise ReadOnlyPolicyError(f"cannot inspect Git config: {config}")
+            for entry in proc.stdout.splitlines():
+                key, separator, value = entry.partition("=")
+                if _execution_capable_git_key(key, value if separator else ""):
+                    raise ReadOnlyPolicyError(f"untrusted Git config: {key.lower()}")
+
     def _git(self, *args: str, env_overrides: Mapping[str, str] | None = None) -> str:
         python_path = Path(sys.executable)
         if (not python_path.is_absolute() or python_path.name == "env" or " " in sys.executable
                 or not python_path.is_file() or not os.access(python_path, os.X_OK)):
             raise ReadOnlyPolicyError("trusted Git launcher requires an absolute Python executable")
         before = _git_metadata_fingerprint(self.target_root, *self._git_dirs)
+        self._check_execution_capable_git_config()
         env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR") if key in os.environ}
         enforced = _ENFORCED_GIT_CONFIG
         env.update(
@@ -879,6 +974,7 @@ class LocalReadOnlyExecutor:
                 check=False,
             )
         finally:
+            self._check_execution_capable_git_config()
             after = _git_metadata_fingerprint(self.target_root, *self._git_dirs)
             if after != before:
                 raise ReadOnlyPolicyError("Git metadata changed during Git command")
