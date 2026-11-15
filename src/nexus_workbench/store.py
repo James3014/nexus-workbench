@@ -5,12 +5,12 @@ import fcntl
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, TypeVar
 
 from .model import ActionCell, Candidate, ObservationBundle, WorkbenchNotebook
 from .resume import ArtifactRecord, ResumeCheckpoint, ResumeHead, ResumePhase
+from .safe_paths import open_directory, open_parent, open_path
 
 T = TypeVar("T")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -40,6 +40,14 @@ class JsonWorkbenchStore:
 
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
+        try:
+            root_info = os.stat(self.root, follow_symlinks=False)
+        except FileNotFoundError:
+            root_info = None
+        self.root.mkdir(parents=True, exist_ok=True)
+        if root_info is None:
+            root_info = os.stat(self.root, follow_symlinks=False)
+        self._root_fd = open_directory(self.root, root_info)
 
     def _path(self, kind: str, *parts: str) -> Path:
         safe = [_safe_id(part, "state identity") for part in parts]
@@ -68,9 +76,12 @@ class JsonWorkbenchStore:
 
     @contextmanager
     def _session_lock(self, workbench_session_id: str) -> Iterator[None]:
-        path = self._lock_path(workbench_session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+", encoding="utf-8") as handle:
+        session = _safe_id(workbench_session_id, "workbench_session_id")
+        try:
+            fd = open_path(self._root_fd, ("locks", f"{session}.lock"), os.O_RDWR | os.O_CREAT, create_parents=True)
+        except OSError as exc:
+            raise ValueError("lock path escapes Workbench store") from exc
+        with os.fdopen(fd, "a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
@@ -78,31 +89,31 @@ class JsonWorkbenchStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _write(self, path: Path, payload: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        rel = path.relative_to(self.root)
+        parent_fd, name = open_parent(self._root_fd, rel.parts, create=True)
         raw = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=".wb-",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-            temp_path = Path(handle.name)
-        temp_path.replace(path)
-        fd = os.open(path.parent, os.O_RDONLY)
         try:
-            os.fsync(fd)
+            temp_name = f".wb-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _read(self, path: Path, loader: Callable[[Mapping[str, Any]], T]) -> T:
+        rel = path.relative_to(self.root)
+        fd = open_path(self._root_fd, rel.parts)
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as handle:
+                raw = handle.read()
         finally:
             os.close(fd)
-
-    @staticmethod
-    def _read(path: Path, loader: Callable[[Mapping[str, Any]], T]) -> T:
         data = json.loads(
-            path.read_text(encoding="utf-8"),
+            raw,
             object_pairs_hook=_reject_duplicate_keys,
         )
         if not isinstance(data, Mapping):
@@ -117,8 +128,11 @@ class JsonWorkbenchStore:
         value: T,
         label: str,
     ) -> Path:
-        if path.exists():
+        try:
             existing = self._read(path, loader)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
             if existing != value:
                 raise ValueError(
                     f"{label} is immutable and already exists with different content"
@@ -163,7 +177,7 @@ class JsonWorkbenchStore:
         )
 
     def action_exists(self, workbench_session_id: str, step_id: str) -> bool:
-        return self._path("actions", workbench_session_id, step_id).exists()
+        return self._exists(self._path("actions", workbench_session_id, step_id))
 
     def save_observation(self, observation: ObservationBundle) -> Path:
         path = self._path(
@@ -187,7 +201,7 @@ class JsonWorkbenchStore:
         )
 
     def observation_exists(self, workbench_session_id: str, step_id: str) -> bool:
-        return self._path("observations", workbench_session_id, step_id).exists()
+        return self._exists(self._path("observations", workbench_session_id, step_id))
 
     def save_artifact(self, artifact: ArtifactRecord) -> Path:
         path = self._path(
@@ -211,7 +225,17 @@ class JsonWorkbenchStore:
         )
 
     def artifact_exists(self, workbench_session_id: str, artifact_id: str) -> bool:
-        return self._path("artifacts", workbench_session_id, artifact_id).exists()
+        return self._exists(self._path("artifacts", workbench_session_id, artifact_id))
+
+    def _exists(self, path: Path) -> bool:
+        rel = path.relative_to(self.root)
+        try:
+            fd = open_path(self._root_fd, rel.parts)
+        except FileNotFoundError:
+            return False
+        else:
+            os.close(fd)
+            return True
 
     def save_candidate(self, candidate: Candidate) -> Path:
         path = self._path("candidates", candidate.workbench_session_id)

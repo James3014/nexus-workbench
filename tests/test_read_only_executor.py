@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -11,6 +16,11 @@ from unittest import mock
 from nexus_workbench import ActionCell, ActionMode, ObservationOutcome
 from nexus_workbench import read_only_executor
 from nexus_workbench.read_only_executor import LocalReadOnlyExecutor, ReadOnlyPolicyError
+
+TRUSTED_GIT = next(
+    (c for c in ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git") if os.path.exists(c)),
+    "/usr/bin/git",
+)
 
 
 def git(root: Path, *args: str) -> str:
@@ -27,6 +37,8 @@ def git(root: Path, *args: str) -> str:
 
 class RepoFixture:
     def __init__(self) -> None:
+        self.git_config_env = mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": os.devnull})
+        self.git_config_env.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.target = self.root / "target"
@@ -60,6 +72,7 @@ class RepoFixture:
 
     def close(self) -> None:
         self.temp.cleanup()
+        self.git_config_env.stop()
 
 
 def action(
@@ -82,6 +95,15 @@ def action(
 
 class ReadOnlyExecutorCanaryTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.git_env = mock.patch.dict("os.environ", {
+            "NEXUS_WORKBENCH_GIT_EXECUTABLE": TRUSTED_GIT,
+            "GIT_NO_REPLACE_OBJECTS": "",
+        })
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
+        self.config_path = mock.patch.object(read_only_executor, "_GIT_CONFIG_PATH", Path("/missing-workbench-git.conf"), create=True)
+        self.config_path.start()
+        self.addCleanup(self.config_path.stop)
         self.fixture = RepoFixture()
         self.executor = LocalReadOnlyExecutor.bind(
             self.fixture.target,
@@ -311,8 +333,122 @@ class ReadOnlyExecutorCanaryTests(unittest.TestCase):
         self.assertEqual(via_link.target_identity, self.executor.target_identity)
 
 
+    def test_git_default_discovery_works_without_an_override(self) -> None:
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        self.assertEqual(executor.git_source, "default")
+        self.assertTrue(Path(executor.git_executable).is_absolute())
+
+    def test_git_default_discovery_ignores_path_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as fake_bin:
+            fake = Path(fake_bin) / "git"
+            marker = Path(fake_bin) / "was-run"
+            fake.write_text(f"#!/bin/sh\nprintf called > '{marker}'\nexit 0\n", encoding="utf-8")
+            fake.chmod(0o755)
+            with mock.patch.dict("os.environ", {"PATH": fake_bin}):
+                os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+                executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            self.assertTrue(Path(executor.git_executable).is_absolute())
+            self.assertFalse(marker.exists())
+
+    def test_admin_config_precedes_defaults_when_environment_is_unset(self) -> None:
+        config = Path("/etc/hosts")
+        original_read_text = Path.read_text
+
+        def read_config(path, *args, **kwargs):
+            if path.name == "hosts":
+                return TRUSTED_GIT
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(read_only_executor, "_GIT_CONFIG_PATH", config), \
+             mock.patch.object(Path, "read_text", read_config), \
+             mock.patch.dict("os.environ"):
+            os.environ.pop("NEXUS_WORKBENCH_GIT_EXECUTABLE", None)
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        self.assertEqual(executor.git_source, "config")
+        self.assertEqual(executor.git_executable, str(Path(TRUSTED_GIT).resolve()))
+
+    def test_caller_writable_override_is_rejected_before_version_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / "git"
+            marker = Path(tmp) / "was-run"
+            wrapper.write_text(
+                f"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version fake'; exit 0; fi\n"
+                f"printf called > '{marker}'\nexec {TRUSTED_GIT} \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            with mock.patch.dict("os.environ", {"NEXUS_WORKBENCH_GIT_EXECUTABLE": str(wrapper)}):
+                with self.assertRaisesRegex(ReadOnlyPolicyError, "NEXUS_WORKBENCH_GIT_EXECUTABLE"):
+                    LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            self.assertFalse(marker.exists())
+
+    def test_caller_owned_git_is_rejected_even_when_writability_check_is_unavailable(self) -> None:
+        caller_uid = os.getuid()
+        if caller_uid == 0:
+            self.skipTest("root is already an approved Git owner")
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / "git"
+            marker = Path(tmp) / "was-run"
+            wrapper.write_text(
+                f"#!/bin/sh\nprintf called > '{marker}'\necho 'git version fixture'\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            real_stat = Path.stat
+
+            def with_owner(info, uid: int):
+                values = list(info)
+                values[4] = uid
+                return os.stat_result(values)
+
+            def owner_simulating_stat(path: Path, *args, **kwargs):
+                info = real_stat(path, *args, **kwargs)
+                if path == wrapper:
+                    return with_owner(info, caller_uid)
+                if stat.S_ISDIR(info.st_mode):
+                    return with_owner(info, 0)
+                return info
+
+            with mock.patch.object(Path, "stat", owner_simulating_stat), \
+                 mock.patch.object(os, "access", return_value=False), \
+                 mock.patch.dict("os.environ", {"NEXUS_WORKBENCH_GIT_EXECUTABLE": str(wrapper)}):
+                with self.assertRaisesRegex(ReadOnlyPolicyError, "trusted Git executable rejected"):
+                    read_only_executor._resolve_trusted_git()
+            self.assertFalse(marker.exists())
+
+    def test_git_evidence_matches_the_executable_passed_to_launcher(self) -> None:
+        executor = self.executor
+        launched: list[list[str]] = []
+        replace_guard_values: list[str | None] = []
+        real_run = subprocess.run
+
+        def record_run(args, *pargs, **kwargs):
+            if isinstance(args, (list, tuple)) and executor.git_executable in args:
+                launched.append(list(args))
+                replace_guard_values.append(kwargs.get("env", {}).get("GIT_NO_REPLACE_OBJECTS"))
+            return real_run(args, *pargs, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=record_run):
+            executor._git("rev-parse", "HEAD")
+        evidence = executor.snapshot().summary()
+        self.assertTrue(launched)
+        self.assertTrue(replace_guard_values)
+        self.assertTrue(all(value == "1" for value in replace_guard_values))
+        self.assertIn(executor.git_executable, launched[-1])
+        self.assertEqual(evidence["git_sha256"], read_only_executor._sha256_bytes(Path(executor.git_executable).read_bytes()))
+        self.assertEqual(evidence["git_source"], "environment")
+        self.assertTrue(evidence["git_owner"])
+        self.assertTrue(evidence["git_mode"])
+        self.assertTrue(evidence["git_version"])
+        self.assertTrue(evidence["git_replace_ref_check_passed"])
+
 class ManifestLimitTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.git_env = mock.patch.dict("os.environ", {"GIT_NO_REPLACE_OBJECTS": ""})
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
         self.fixture = RepoFixture()
 
     def tearDown(self) -> None:
@@ -344,6 +480,651 @@ class ManifestLimitTests(unittest.TestCase):
         with mock.patch.object(read_only_executor, "_MAX_MANIFEST_ENTRIES", 3):
             with self.assertRaisesRegex(ReadOnlyPolicyError, "manifest limit"):
                 executor.execute(action("S1", "repo.read", path="README.md"))
+
+    def test_bind_rejects_replace_refs(self) -> None:
+        git(self.fixture.target, "replace", "HEAD", "HEAD")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "replace refs"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_subprocess_env_is_allowlisted(self) -> None:
+        recorded: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            recorded.append(dict(kwargs.get("env") or {}))
+            return real_run(*args, **kwargs)
+
+        poisoned = {
+            "LD_PRELOAD": "/nonexistent.so",
+            "DYLD_INSERT_LIBRARIES": "/nonexistent.dylib",
+            "SECRET_TOKEN": "x",
+            "GIT_CONFIG_COUNT": "1",
+        }
+        with mock.patch.dict("os.environ", poisoned):
+            executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+            with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+                executor._git("rev-parse", "--show-toplevel")
+        self.assertTrue(recorded)
+        for env in recorded:
+            for key in poisoned.keys() - {"GIT_CONFIG_COUNT"}:
+                self.assertNotIn(key, env)
+        self.assertNotEqual(recorded[-1].get("GIT_CONFIG_COUNT"), "1")
+
+    def test_bind_rejects_grafts(self) -> None:
+        info = self.fixture.target / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        head = git(self.fixture.target, "rev-parse", "HEAD").strip()
+        (info / "grafts").write_text(f"{head}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "graft"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_alternates(self) -> None:
+        info = self.fixture.target / ".git" / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "alternates").write_text(str(self.fixture.outside.parent) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "alternate"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_symlinked_git_metadata_files(self) -> None:
+        head = self.fixture.target / ".git" / "HEAD"
+        external = self.fixture.root / "external-head"
+        head.rename(external)
+        head.symlink_to(external)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_hardlinked_git_config(self) -> None:
+        config = self.fixture.target / ".git" / "config"
+        external = self.fixture.root / "external-config"
+        os.link(config, external)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "hard.link|hardlink"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_config_at_any_scope(self) -> None:
+        git(self.fixture.target, "config", "diff.hostile.textconv", "touch /tmp/workbench-pwned")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_config_in_nested_repository(self) -> None:
+        nested = self.fixture.target / "nested"
+        nested.mkdir()
+        git(nested, "init")
+        (nested / "README.md").write_text("nested\n", encoding="utf-8")
+        git(nested, "config", "filter.hostile.clean", "hostile")
+        git(nested, "add", "-A")
+        git(nested, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "nested")
+        git(self.fixture.target, "add", "nested")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "add nested")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_execution_capable_config_in_submodule_gitdir(self) -> None:
+        source = self.fixture.root / "submodule-source"
+        source.mkdir()
+        git(source, "init")
+        (source / "README.md").write_text("submodule\n", encoding="utf-8")
+        git(source, "add", "README.md")
+        git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial")
+        git(self.fixture.target, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "submodule")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-am", "add submodule")
+        config = self.fixture.target / ".git" / "modules" / "submodule" / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write('[filter "hostile"]\n\tclean = hostile\n')
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_rechecks_execution_capable_config_added_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with (self.fixture.target / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write('[core]\n\tfsmonitor = hostile\n')
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
+    def test_git_rechecks_execution_capable_config_replaced_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        config = self.fixture.target / ".git" / "config"
+        replacement = config.with_name("config.new")
+        replacement.write_text(config.read_text(encoding="utf-8") + '[filter "hostile"]\n\tclean = hostile\n', encoding="utf-8")
+        replacement.replace(config)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
+    def test_git_rechecks_new_worktree_config_after_bind(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with (self.fixture.target / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write('[extensions]\n\tworktreeConfig = true\n')
+        (self.fixture.target / ".git" / "config.worktree").write_text(
+            '[core]\n\tfsmonitor = hostile\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            executor._git("status", "--porcelain=v2")
+
+    def test_bind_ignores_global_filter_config_but_rejects_local_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            global_config = Path(tmp) / "gitconfig"
+            subprocess.run(["git", "config", "--file", str(global_config), "filter.lfs.clean", "git-lfs clean %f"],
+                           check=True, capture_output=True)
+            with mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": str(global_config)}):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+        git(self.fixture.target, "config", "filter.local.clean", "hostile")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_ignores_execution_capable_system_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system_config = Path(tmp) / "gitconfig"
+            subprocess.run(["git", "config", "--file", str(system_config), "core.fsmonitor", "hostile"],
+                           check=True, capture_output=True)
+            with mock.patch.dict("os.environ", {"GIT_CONFIG_SYSTEM": str(system_config)}):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_each_execution_capable_config_family(self) -> None:
+        keys = (
+            "filter.hostile.process", "filter.hostile.clean", "filter.hostile.smudge",
+            "diff.hostile.command", "core.fsmonitor", "core.hooksPath", "include.path",
+            "includeIf.gitdir:/tmp/.path", "extensions.worktreeConfig",
+        )
+        for index, key in enumerate(keys):
+            with self.subTest(key=key):
+                fixture = RepoFixture()
+                try:
+                    value = "true" if key == "extensions.worktreeConfig" else "/tmp/hostile"
+                    git(fixture.target, "config", key, value)
+                    with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+                        LocalReadOnlyExecutor.bind(fixture.target, fixture.scratch)
+                finally:
+                    fixture.close()
+
+    def test_bind_rejects_unknown_and_partial_clone_config_keys(self) -> None:
+        cases = (
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.uploadpack", "hostile"),
+            ("core.unrecognizedFutureSetting", "value"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key):
+                fixture = RepoFixture()
+                try:
+                    git(fixture.target, "config", key, value)
+                    with self.assertRaisesRegex(ReadOnlyPolicyError, "untrusted Git config"):
+                        LocalReadOnlyExecutor.bind(fixture.target, fixture.scratch)
+                finally:
+                    fixture.close()
+
+    def test_config_key_allowlist_is_case_insensitive_and_keeps_safe_submodule_settings(self) -> None:
+        git(self.fixture.target, "config", "submodule.fixture.url", "https://example.invalid/repo")
+        git(self.fixture.target, "config", "submodule.fixture.active", "true")
+        git(self.fixture.target, "config", "UsEr.NaMe", "Fixture")
+        LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_case_variant_metadata_and_config_names(self) -> None:
+        # Simulate case-insensitive filesystem lookups on Linux by placing case variants
+        # in metadata; the policy must treat these names as Git metadata everywhere.
+        cases = ("Config", "CONFIG", "Config.Worktree", "Head", "Refs/Replace", "Objects/Info/Alternates")
+        for name in cases:
+            with self.subTest(name=name):
+                fixture = RepoFixture()
+                try:
+                    path = fixture.target / ".git" / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if name.lower().endswith("config") or name.lower().endswith("config.worktree"):
+                        path.write_text('[core]\n\tfsmonitor = hostile\n', encoding="utf-8")
+                    else:
+                        path.write_text("hostile\n", encoding="utf-8")
+                    with self.assertRaises(ReadOnlyPolicyError):
+                        LocalReadOnlyExecutor.bind(fixture.target, fixture.scratch)
+                finally:
+                    fixture.close()
+
+    def test_bind_finds_case_variant_nested_gitdir_and_gitfile(self) -> None:
+        nested = self.fixture.target / "nested"
+        nested.mkdir()
+        git(nested, "init")
+        git(nested, "config", "user.name", "nested")
+        git(nested, "config", "user.email", "nested@example.invalid")
+        git(nested, "config", "filter.hostile.clean", "hostile")
+        (nested / "README.md").write_text("nested\n", encoding="utf-8")
+        git(nested, "add", "README.md")
+        git(nested, "-c", "user.name=nested", "-c", "user.email=nested@example.invalid", "commit", "-m", "nested")
+        git(self.fixture.target, "add", "nested")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "nested")
+        (nested / ".git").rename(nested / ".GIT")
+        with self.assertRaises(ReadOnlyPolicyError):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_finds_case_variant_gitfile_and_nested_config(self) -> None:
+        source = self.fixture.root / "submodule-source"
+        source.mkdir()
+        git(source, "init")
+        (source / "README.md").write_text("submodule\n", encoding="utf-8")
+        git(source, "add", "README.md")
+        git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial")
+        git(self.fixture.target, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "submodule")
+        git(self.fixture.target, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-am", "submodule")
+        config = self.fixture.target / ".git" / "modules" / "submodule" / "config"
+        config.rename(config.with_name("CONFIG"))
+        (self.fixture.target / "submodule" / ".git").rename(self.fixture.target / "submodule" / ".GIT")
+        with self.assertRaises(ReadOnlyPolicyError):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_forged_commit_graph_cannot_make_staged_change_look_clean(self) -> None:
+        changed = self.fixture.target / "README.md"
+        changed.write_text("tampered tree\n", encoding="utf-8")
+        git(self.fixture.target, "add", "README.md")
+        staged_tree = git(self.fixture.target, "write-tree").strip()
+        git(self.fixture.target, "commit-graph", "write", "--reachable")
+        graph = self.fixture.target / ".git" / "objects" / "info" / "commit-graph"
+        data = bytearray(graph.read_bytes())
+        self.assertEqual(data[:4], b"CGPH")
+        chunk_count = data[6]
+        chunks = {}
+        cursor = 8
+        for _ in range(chunk_count):
+            chunk_id = bytes(data[cursor:cursor + 4])
+            offset = int.from_bytes(data[cursor + 4:cursor + 12], "big")
+            chunks[chunk_id] = offset
+            cursor += 12
+        oid_fanout = chunks[b"OIDF"]
+        oid_lookup = chunks[b"OIDL"]
+        cdat = chunks[b"CDAT"]
+        head = git(self.fixture.target, "rev-parse", "HEAD").strip()
+        oid_fanout_end = oid_fanout + 256 * 4
+        commit_count = int.from_bytes(data[oid_fanout_end - 4:oid_fanout_end], "big")
+        oid_list = [bytes(data[oid_lookup + index * 20:oid_lookup + (index + 1) * 20])
+                    for index in range(commit_count)]
+        commit_index = oid_list.index(bytes.fromhex(head))
+        commit_data_row_size = 36
+        tree_offset = cdat + commit_index * commit_data_row_size
+        data[tree_offset:tree_offset + 20] = bytes.fromhex(staged_tree)
+        data[-20:] = hashlib.sha1(data[:-20]).digest()
+        graph.chmod(0o600)
+        graph.write_bytes(data)
+
+        forged_status = git(self.fixture.target, "-c", "core.commitGraph=true", "status", "--porcelain")
+        self.assertEqual(forged_status, "")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "clean"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_failed_config_precheck_does_not_launch_requested_git_command(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with (self.fixture.target / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write("[remote \"origin\"]\n\tpromisor = true\n")
+        real_run = subprocess.run
+        requested_git_launches = []
+
+        def spy(*args, **kwargs):
+            command = args[0] if args else []
+            if isinstance(command, list) and len(command) > 4 and command[0] == sys.executable:
+                requested_git_launches.append(command)
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+            with self.assertRaises(ReadOnlyPolicyError):
+                executor._git("status", "--porcelain=v2")
+        self.assertEqual(requested_git_launches, [])
+
+    def test_git_pins_lazy_fetch_and_commit_graph_off(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        recorded: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            if args and isinstance(args[0], list) and args[0] and args[0][0] == sys.executable:
+                recorded.append(dict(kwargs.get("env") or {}))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+            executor._git("rev-parse", "HEAD")
+        env = recorded[-1]
+        self.assertEqual(env.get("GIT_NO_LAZY_FETCH"), "1")
+        values = [env.get(f"GIT_CONFIG_KEY_{i}", "").lower() + "=" + env.get(f"GIT_CONFIG_VALUE_{i}", "")
+                  for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))]
+        self.assertIn("core.commitgraph=false", values)
+        self.assertIn("gc.writecommitgraph=false", values)
+
+    def test_git_launcher_uses_isolated_python_mode(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        launched: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            command = args[0] if args else []
+            if isinstance(command, list) and command and command[0] == sys.executable:
+                launched.append(command)
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+            executor._git("rev-parse", "HEAD")
+        self.assertTrue(launched)
+        self.assertIn("-I", launched[-1])
+        self.assertIn("-S", launched[-1])
+
+    def test_git_invocation_overrides_execution_capable_config(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        recorded: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            if args and isinstance(args[0], list) and args[0] and args[0][0] == sys.executable:
+                recorded.append(dict(kwargs.get("env") or {}))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=spy):
+            executor._git("rev-parse", "HEAD")
+        self.assertTrue(recorded)
+        env = recorded[-1]
+        self.assertEqual(env.get("GIT_CONFIG_NOSYSTEM"), "1")
+        self.assertEqual(env.get("GIT_CONFIG_GLOBAL"), os.devnull)
+        self.assertGreaterEqual(int(env.get("GIT_CONFIG_COUNT", "0")), 10)
+        values = [env.get(f"GIT_CONFIG_KEY_{i}", "") + "=" + env.get(f"GIT_CONFIG_VALUE_{i}", "")
+                  for i in range(int(env.get("GIT_CONFIG_COUNT", "0")))]
+        self.assertIn("core.sshCommand=", values)
+        self.assertIn("credential.helper=", values)
+        self.assertIn("protocol.ext.allow=never", values)
+        for setting in (
+            "core.fsmonitor=false", "core.hooksPath=/dev/null", "core.pager=cat",
+            "core.editor=", "core.askPass=", "diff.external=", "include.path=/dev/null",
+            "includeIf.gitdir:/__nexus_workbench_never__/.path=/dev/null",
+        ):
+            self.assertIn(setting, values)
+
+    def test_git_fails_closed_when_python_executable_is_not_absolute(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with mock.patch.object(read_only_executor.sys, "executable", "python3"):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "absolute Python"):
+                executor._git("rev-parse", "HEAD")
+
+    def test_git_fails_closed_when_python_executable_is_missing(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        with mock.patch.object(read_only_executor.sys, "executable", "/missing/python"):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "absolute Python"):
+                executor._git("rev-parse", "HEAD")
+
+    def test_diff_disables_external_diff_and_textconv(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        real_run = subprocess.run
+        launched: list[list[str]] = []
+
+        def record(args, *pargs, **kwargs):
+            if isinstance(args, (list, tuple)) and executor.git_executable in args and "diff" in args:
+                launched.append(list(args))
+            return real_run(args, *pargs, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=record):
+            executor._git("diff")
+        self.assertTrue(launched)
+        self.assertIn("--no-ext-diff", launched[-1])
+        self.assertIn("--no-textconv", launched[-1])
+
+    def test_git_rechecks_metadata_inode_after_run(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        config = self.fixture.target / ".git" / "config"
+        real_run = subprocess.run
+        swapped = False
+
+        def swap_after_git(*args, **kwargs):
+            nonlocal swapped
+            result = real_run(*args, **kwargs)
+            if not swapped and args and isinstance(args[0], list) and args[0][0] == sys.executable:
+                replacement = config.with_suffix(".new")
+                replacement.write_bytes(config.read_bytes())
+                replacement.replace(config)
+                swapped = True
+            return result
+
+        with mock.patch.object(read_only_executor.subprocess, "run", side_effect=swap_after_git):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "changed during|Git metadata"):
+                executor._git("rev-parse", "HEAD")
+        self.assertTrue(swapped)
+
+    def test_bind_rejects_objects_symlink_to_external_database(self) -> None:
+        objects = self.fixture.target / ".git" / "objects"
+        external = self.fixture.root / "external-objects"
+        objects.rename(external)
+        objects.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink|outside"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_refs_symlink_to_external_directory(self) -> None:
+        refs = self.fixture.target / ".git" / "refs"
+        external = self.fixture.root / "external-refs"
+        refs.rename(external)
+        refs.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "symlink|outside"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_bind_rejects_git_dir_outside_target(self) -> None:
+        external = self.fixture.root / "external-gitdir"
+        shutil.move(str(self.fixture.target / ".git"), str(external))
+        (self.fixture.target / ".git").write_text(f"gitdir: {external}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ReadOnlyPolicyError, "outside"):
+            LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_executable_ignores_path_wrapper_for_trusted_absolute_path(self) -> None:
+        real_git = TRUSTED_GIT
+        with tempfile.TemporaryDirectory() as fake_bin:
+            fake = Path(fake_bin) / "git"
+            marker = Path(fake_bin) / "was-run"
+            fake.write_text(
+                f"#!/bin/sh\nprintf called > '{marker}'\nexec {real_git} \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            with mock.patch.dict("os.environ", {
+                "PATH": fake_bin,
+                "NEXUS_WORKBENCH_GIT_EXECUTABLE": real_git,
+            }):
+                executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+                top = executor._git("rev-parse", "--show-toplevel").strip()
+            self.assertEqual(Path(top), self.fixture.target.resolve())
+            self.assertFalse(marker.exists(), "Git was substituted by the caller's PATH wrapper")
+            self.assertEqual(Path(executor.git_executable), Path(real_git).resolve())
+            self.assertTrue(executor.git_version)
+
+    def test_git_executable_fails_closed_without_trusted_absolute_path(self) -> None:
+        with mock.patch.dict("os.environ", {"NEXUS_WORKBENCH_GIT_EXECUTABLE": ""}):
+            with self.assertRaisesRegex(ReadOnlyPolicyError, "NEXUS_WORKBENCH_GIT_EXECUTABLE"):
+                LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def test_git_environment_overrides_cannot_redirect_snapshot(self) -> None:
+        executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+        foreign = self.fixture.root / "foreign.git"
+        subprocess.run(["git", "init", "--bare", str(foreign)], check=True, capture_output=True)
+        subprocess.run(["git", "--git-dir", str(foreign), "--work-tree", str(self.fixture.target), "add", "-A"], check=True, capture_output=True)
+        with mock.patch.dict("os.environ", {
+            "GIT_DIR": str(foreign),
+            "GIT_WORK_TREE": str(self.fixture.root),
+            "GIT_INDEX_FILE": str(foreign / "index"),
+            "GIT_NAMESPACE": "forged",
+        }):
+            self.assertEqual(Path(executor._git("rev-parse", "--show-toplevel").strip()), self.fixture.target.resolve())
+            self.assertEqual(executor._git("rev-parse", "HEAD").strip(), executor.baseline.head)
+
+
+class DescriptorRaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RepoFixture()
+        self.executor = LocalReadOnlyExecutor.bind(self.fixture.target, self.fixture.scratch)
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def test_repo_read_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "README.md"
+        original = self.executor._target_path
+        swapped = False
+
+        def swap_after_check(value):
+            nonlocal swapped
+            resolved = original(value)
+            if value == "README.md" and not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+            return resolved
+
+        with mock.patch.object(self.executor, "_target_path", swap_after_check):
+            try:
+                observed = self.executor._repo_read({"op": "repo.read", "path": "README.md"})
+            except (OSError, ReadOnlyPolicyError):
+                observed = {"text": ""}
+        self.assertTrue(swapped)
+        self.assertNotEqual(observed["text"], "outside secret\n")
+
+    def test_snapshot_git_uses_pinned_target_after_path_replacement(self) -> None:
+        pinned_head = self.executor.baseline.head
+        target = self.fixture.target
+        displaced = self.fixture.root / "displaced-target"
+        replacement = self.fixture.root / "replacement"
+        replacement.mkdir()
+        git(replacement, "init")
+        git(replacement, "config", "user.email", "replacement@example.invalid")
+        git(replacement, "config", "user.name", "Replacement")
+        (replacement / "README.md").write_text("replacement tree\n", encoding="utf-8")
+        git(replacement, "add", ".")
+        git(replacement, "commit", "-m", "replacement")
+        swapped = False
+        original_git = self.executor._git
+
+        def swap_before_git(*args):
+            nonlocal swapped
+            if not swapped:
+                target.rename(displaced)
+                replacement.rename(target)
+                swapped = True
+            return original_git(*args)
+
+        with mock.patch.object(self.executor, "_git", side_effect=swap_before_git):
+            snapshot = self.executor.snapshot()
+        self.assertTrue(swapped, "the target path replacement must occur during the snapshot")
+        self.assertEqual(snapshot.head, pinned_head)
+
+    def test_repo_search_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "README.md"
+        original_is_file = Path.is_file
+        original_open_path = getattr(read_only_executor, "open_path", None)
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def is_file_then_swap(candidate, *args, **kwargs):
+            result = original_is_file(candidate, *args, **kwargs)
+            if candidate.name == path.name:
+                replace_candidate()
+            return result
+
+        def open_then_swap(*args, **kwargs):
+            if args[1][-1] == path.name:
+                replace_candidate()
+            return original_open_path(*args, **kwargs)
+
+        with mock.patch.object(Path, "is_file", is_file_then_swap), mock.patch.object(
+            read_only_executor, "open_path", open_then_swap, create=True
+        ):
+            try:
+                observed = self.executor._repo_search({"op": "repo.search", "path": ".", "query": "outside secret", "max_results": 10})
+            except (OSError, ReadOnlyPolicyError, ValueError):
+                observed = {"matches": []}
+        self.assertTrue(swapped)
+        self.assertEqual(observed["matches"], [])
+
+    def test_test_discover_does_not_follow_replacement_symlink(self) -> None:
+        path = self.fixture.target / "tests" / "test_safe.py"
+        original_resolve = Path.resolve
+        original_open_path = getattr(read_only_executor, "open_path", None)
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                self.fixture.outside.write_text("def test_outside_secret_marker():\n    pass\n", encoding="utf-8")
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def resolve_then_replace(candidate, *args, **kwargs):
+            result = original_resolve(candidate, *args, **kwargs)
+            if candidate.name == path.name:
+                replace_candidate()
+            return result
+
+        def open_then_replace(*args, **kwargs):
+            if args[1][-1] == path.name:
+                replace_candidate()
+            return original_open_path(*args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", resolve_then_replace), mock.patch.object(
+            read_only_executor, "open_path", open_then_replace, create=True
+        ):
+            try:
+                observed = self.executor._test_discover({"op": "test.discover", "path": "tests"})
+            except (OSError, ReadOnlyPolicyError):
+                observed = {"tests": [], "files": []}
+        self.assertTrue(swapped)
+        self.assertNotIn("test_outside_secret_marker", str(observed))
+
+    def test_manifest_fingerprints_opened_regular_file(self) -> None:
+        path = self.fixture.target / "README.md"
+        original_open = os.open
+        original_path_open = Path.open
+        swapped = False
+
+        def replace_candidate() -> None:
+            nonlocal swapped
+            if not swapped:
+                path.unlink()
+                path.symlink_to(self.fixture.outside)
+                swapped = True
+
+        def swap_then_open(candidate, flags, *args, **kwargs):
+            if candidate == path.name and kwargs.get("dir_fd") is not None:
+                replace_candidate()
+            return original_open(candidate, flags, *args, **kwargs)
+
+        def swap_then_path_open(candidate, *args, **kwargs):
+            if candidate.name == path.name:
+                replace_candidate()
+            return original_path_open(candidate, *args, **kwargs)
+
+        with mock.patch.object(os, "open", swap_then_open), mock.patch.object(Path, "open", swap_then_path_open):
+            try:
+                entries = read_only_executor._manifest(self.fixture.target)
+            except OSError:
+                entries = {}
+        self.assertTrue(swapped)
+        outside_hash = read_only_executor._sha256_bytes(self.fixture.outside.read_bytes())
+        self.assertNotIn(outside_hash, str(entries.get("README.md", "")))
+
+    def test_artifact_parent_swap_cannot_redirect_write(self) -> None:
+        outside = self.fixture.root / "escaped"
+        original = self.executor._scratch_path
+        swapped = False
+
+        def swap_after_validation(value):
+            nonlocal swapped
+            result = original(value)
+            parent = self.fixture.scratch / "notes"
+            if not swapped:
+                parent.mkdir(exist_ok=True)
+                parent.rmdir()
+                parent.symlink_to(self.fixture.root, target_is_directory=True)
+                swapped = True
+            return result
+
+        with mock.patch.object(self.executor, "_scratch_path", swap_after_validation):
+            try:
+                self.executor._artifact_write({"op": "artifact.write", "path": "notes/escaped", "content": "secret"})
+            except (OSError, ReadOnlyPolicyError):
+                pass
+        self.assertTrue(swapped)
+        self.assertFalse(outside.exists())
 
 
 if __name__ == "__main__":
