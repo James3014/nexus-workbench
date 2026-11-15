@@ -37,7 +37,32 @@ _ENFORCED_GIT_CONFIG = (
     ("core.askPass", ""), ("diff.external", ""), ("include.path", "/dev/null"),
     ("includeIf.gitdir:/__nexus_workbench_never__/.path", "/dev/null"),
     ("protocol.ext.allow", "never"), ("credential.helper", ""),
+    ("core.commitGraph", "false"), ("gc.writeCommitGraph", "false"),
 )
+
+
+def _casefold_path_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _known_harmless_git_key(key: str, value: str) -> bool:
+    """Allow only inert repository config; unknown keys fail closed."""
+    key = key.casefold()
+    value = value.strip().casefold()
+    fixed = {
+        "core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates",
+        "core.ignorecase", "core.precomposeunicode", "core.symlinks", "user.name", "user.email",
+        "init.defaultbranch", "extensions.objectformat",
+    }
+    if key in fixed:
+        return True
+    if key == "extensions.worktreeconfig":
+        return value in {"false", "no", "off", "0"}
+    return (
+        key.startswith("remote.") and key.endswith((".url", ".fetch"))
+        or key.startswith("submodule.") and key.endswith((".url", ".active"))
+        or key.startswith("branch.") and key.endswith((".remote", ".merge"))
+    )
 
 
 class ReadOnlyPolicyError(ValueError):
@@ -108,15 +133,17 @@ def _git_metadata_roots(target: Path, primary_git_dir: Path, primary_common_dir:
     roots: list[Path] = [primary_git_dir, primary_common_dir]
     for current, directories, files in os.walk(target, followlinks=False):
         current_path = Path(current)
-        if ".git" in directories:
-            entry = current_path / ".git"
+        git_directory = next((name for name in directories if name.casefold() == ".git"), None)
+        git_file = next((name for name in files if name.casefold() == ".git"), None)
+        if git_directory is not None:
+            entry = current_path / git_directory
             info = os.lstat(entry)
             if stat.S_ISLNK(info.st_mode):
                 raise ReadOnlyPolicyError(f"Git metadata symlink is forbidden: {entry}")
             roots.append(entry)
-            directories.remove(".git")
-        elif ".git" in files:
-            entry = current_path / ".git"
+            directories.remove(git_directory)
+        elif git_file is not None:
+            entry = current_path / git_file
             info = os.lstat(entry)
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                 raise ReadOnlyPolicyError(f"Git metadata entry is invalid: {entry}")
@@ -185,12 +212,20 @@ def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> 
                 info = os.lstat(path)
                 if stat.S_ISLNK(info.st_mode):
                     raise ReadOnlyPolicyError(f"Git metadata symlink is forbidden: {path}")
+                relative_parts = _casefold_path_parts(path.relative_to(root))
+                canonical_alias = (
+                    not relative_parts and path.name.casefold() == "head" and path.name != "HEAD"
+                    or path.name.casefold() in {"config", "config.worktree"}
+                    and path.name not in {"config", "config.worktree"}
+                )
+                if canonical_alias:
+                    raise ReadOnlyPolicyError(f"case-variant Git metadata path is forbidden: {path}")
                 real = path.resolve(strict=True)
                 if real != target and not real.is_relative_to(target):
                     raise ReadOnlyPolicyError(f"Git metadata path is outside the target repository: {path}")
-                if path.name in {"config", "config.worktree"} and stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                if path.name.casefold() in {"config", "config.worktree"} and stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                     raise ReadOnlyPolicyError(f"Git config hardlink is forbidden: {path}")
-                if path.name in {"gitdir", "commondir"} and stat.S_ISREG(info.st_mode):
+                if path.name.casefold() in {"gitdir", "commondir"} and stat.S_ISREG(info.st_mode):
                     raw_pointer = Path(path.read_text(encoding="utf-8").strip())
                     pointer = raw_pointer if raw_pointer.is_absolute() else path.parent / raw_pointer
                     real_pointer = pointer.resolve(strict=True)
@@ -198,13 +233,19 @@ def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> 
                         raise ReadOnlyPolicyError(f"Git metadata pointer is outside the target repository: {path}")
                 found[str(path)] = info
 
-    for directory in dict.fromkeys((git_dir, common_dir)):
-        if (directory / "objects" / "info" / "alternates").exists():
-            raise ReadOnlyPolicyError("Git alternate object databases are forbidden")
-        if (directory / "info" / "grafts").exists():
-            raise ReadOnlyPolicyError("Git grafts are forbidden")
-        if (directory / "refs" / "replace").exists():
-            raise ReadOnlyPolicyError("Git replace refs are forbidden")
+    for directory in dict.fromkeys(roots):
+        for current, _, files in os.walk(directory, followlinks=False):
+            current_path = Path(current)
+            parts = _casefold_path_parts(current_path.relative_to(directory))
+            names = {name.casefold() for name in files}
+            if parts[-2:] == ("objects", "info") and "alternates" in names:
+                raise ReadOnlyPolicyError("Git alternate object databases are forbidden")
+            if parts == ("info",) and "grafts" in names:
+                raise ReadOnlyPolicyError("Git grafts are forbidden")
+            if parts == ("refs",) and "replace" in {name.casefold() for name in os.listdir(current_path)}:
+                raise ReadOnlyPolicyError("Git replace refs are forbidden")
+            if not parts and "shallow" in names:
+                raise ReadOnlyPolicyError("Git shallow repositories are forbidden")
     return tuple(sorted((path, info.st_dev, info.st_ino, info.st_mode) for path, info in found.items()))
 
 
@@ -895,12 +936,12 @@ class LocalReadOnlyExecutor:
         for root in roots:
             for current, _, files in os.walk(root, followlinks=False):
                 for name in files:
-                    if name in {"config", "config.worktree"}:
+                    if name.casefold() in {"config", "config.worktree"}:
                         config_files.add(Path(current) / name)
         for config in sorted(config_files):
             try:
                 proc = subprocess.run(
-                    [self.git_executable, "config", "--no-includes", "--file", str(config), "--list"],
+                    [self.git_executable, "config", "--no-includes", "--null", "--file", str(config), "--list"],
                     cwd=self.target_root,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
@@ -914,12 +955,14 @@ class LocalReadOnlyExecutor:
                 raise ReadOnlyPolicyError("cannot inspect Git config") from exc
             if proc.returncode:
                 raise ReadOnlyPolicyError(f"cannot inspect Git config: {config}")
-            for entry in proc.stdout.splitlines():
-                key, separator, value = entry.partition("=")
-                if _execution_capable_git_key(key, value if separator else ""):
-                    raise ReadOnlyPolicyError(f"untrusted Git config: {key.lower()}")
+            for entry in proc.stdout.split("\0"):
+                if not entry:
+                    continue
+                key, separator, value = entry.partition("\n")
+                if not separator or not _known_harmless_git_key(key, value):
+                    raise ReadOnlyPolicyError(f"untrusted Git config: {key.casefold()}")
 
-    def _git(self, *args: str, env_overrides: Mapping[str, str] | None = None) -> str:
+    def _git(self, *args: str) -> str:
         python_path = Path(sys.executable)
         if (not python_path.is_absolute() or python_path.name == "env" or " " in sys.executable
                 or not python_path.is_file() or not os.access(python_path, os.X_OK)):
@@ -935,6 +978,7 @@ class LocalReadOnlyExecutor:
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_COUNT": str(len(enforced)),
                 "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_NO_LAZY_FETCH": "1",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
                 "PAGER": "cat",
@@ -943,8 +987,6 @@ class LocalReadOnlyExecutor:
         for index, (key, value) in enumerate(enforced):
             env[f"GIT_CONFIG_KEY_{index}"] = key
             env[f"GIT_CONFIG_VALUE_{index}"] = value
-        if env_overrides:
-            env.update(env_overrides)
         if not hasattr(os, "fchdir") or not sys.executable:
             raise ReadOnlyPolicyError("pinned-directory Git execution is unavailable on this platform")
         launcher = "import os,sys; os.fchdir(int(sys.argv[1])); os.execve(sys.argv[2], sys.argv[2:], os.environ)"
