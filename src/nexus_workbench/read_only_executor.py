@@ -214,7 +214,7 @@ def _git_metadata_fingerprint(target: Path, git_dir: Path, common_dir: Path) -> 
                     raise ReadOnlyPolicyError(f"Git metadata symlink is forbidden: {path}")
                 relative_parts = _casefold_path_parts(path.relative_to(root))
                 canonical_alias = (
-                    not relative_parts and path.name.casefold() == "head" and path.name != "HEAD"
+                    len(relative_parts) == 1 and path.name.casefold() == "head" and path.name != "HEAD"
                     or path.name.casefold() in {"config", "config.worktree"}
                     and path.name not in {"config", "config.worktree"}
                 )
